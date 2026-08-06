@@ -3,22 +3,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { createClient } from '@supabase/supabase-js';
-import { motion, AnimatePresence } from 'framer-motion';
-import { 
-  FileText, 
-  Image as ImageIcon, 
-  Presentation, 
-  FileCode, 
-  UploadCloud, 
-  Trash2, 
-  AlertTriangle, 
-  WifiOff, 
-  CheckCircle2, 
-  Printer, 
-  CreditCard,
-  ArrowLeft,
-  RotateCcw
-} from 'lucide-react';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL || '',
@@ -26,7 +10,7 @@ const supabase = createClient(
 );
 
 const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
-const COST_PER_PAGE = 3; // ₹3 per page
+const COST_PER_PAGE = 4; // ₹4 per page
 
 interface PrinterStatus {
   name: string;
@@ -45,29 +29,25 @@ interface UploadedFile {
 
 export default function KioskPage() {
   const { printer_id } = useParams();
-  
-  // App States
+
   const [showSplash, setShowSplash] = useState(true);
   const [printerStatus, setPrinterStatus] = useState<PrinterStatus | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<'PDF' | 'IMAGE' | 'PPT' | 'DOC'>('PDF');
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [step, setStep] = useState<'upload' | 'checkout' | 'success'>('upload');
-  
-  // Queue & Payment States
+
   const [activeQueue, setActiveQueue] = useState<any[]>([]);
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Splash Screen Timer
   useEffect(() => {
     const timer = setTimeout(() => {
       setShowSplash(false);
-    }, 4500); // 4.5 seconds splash screen match
+    }, 4500);
     return () => clearTimeout(timer);
   }, []);
 
-  // Fetch Printer Status & Subscribe to Realtime Updates
   useEffect(() => {
     if (!printer_id) return;
 
@@ -92,7 +72,6 @@ export default function KioskPage() {
     fetchStatus();
     fetchQueue();
 
-    // Realtime listener for printer telemetry & queue
     const channel = supabase
       .channel('kiosk-realtime')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'printers', filter: `id=eq.${printer_id}` }, (payload) => {
@@ -108,18 +87,15 @@ export default function KioskPage() {
     };
   }, [printer_id]);
 
-  // Handle File Selection with 350 MB Check
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files) return;
 
     const newFiles = Array.from(e.target.files);
-    
-    // Calculate total size of current files + new files
     const currentTotalSize = files.reduce((acc, f) => acc + f.file.size, 0);
     const newFilesTotalSize = newFiles.reduce((acc, f) => acc + f.size, 0);
 
     if (currentTotalSize + newFilesTotalSize > MAX_TOTAL_SIZE_BYTES) {
-      alert("Total size limit exceeded! You can only upload up to 350 MB in total.");
+      alert('Total size limit exceeded! You can only upload up to 350 MB in total.');
       return;
     }
 
@@ -127,7 +103,7 @@ export default function KioskPage() {
       id: Math.random().toString(36).substring(7),
       file,
       category: selectedCategory,
-      pageCount: selectedCategory === 'IMAGE' ? 1 : Math.floor(Math.random() * 5) + 1 // Mock page count; real PDF parsing can be attached here
+      pageCount: selectedCategory === 'IMAGE' ? 1 : Math.floor(Math.random() * 5) + 1,
     }));
 
     setFiles((prev) => [...prev, ...processedFiles]);
@@ -141,12 +117,10 @@ export default function KioskPage() {
   const getTotalCost = () => getTotalPages() * COST_PER_PAGE;
   const getTotalSizeMB = () => (files.reduce((acc, f) => acc + f.file.size, 0) / (1024 * 1024)).toFixed(2);
 
-  // Trigger Razorpay Checkout Window
   const handleRazorpayPayment = async () => {
     setIsProcessingPayment(true);
 
     try {
-      // 1. Call Backend API to create Razorpay Order ID
       const res = await fetch('/api/create-razorpay-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -154,13 +128,12 @@ export default function KioskPage() {
           amount: getTotalCost(),
           printer_id,
           file_count: files.length,
-          total_pages: getTotalPages()
-        })
+          total_pages: getTotalPages(),
+        }),
       });
 
       const orderData = await res.json();
 
-      // 2. Open Razorpay Checkout Modal
       const options = {
         key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID,
         amount: orderData.amount,
@@ -168,19 +141,16 @@ export default function KioskPage() {
         name: 'S.py - Printer World',
         description: `Print Payment (${getTotalPages()} Pages)`,
         order_id: orderData.order_id,
-        handler: async function (response: any) {
-          // Send verification to backend
+        handler: async function () {
           setStep('success');
           setIsProcessingPayment(false);
         },
         modal: {
           ondismiss: function () {
             setIsProcessingPayment(false);
-          }
+          },
         },
-        theme: {
-          color: '#0284c7'
-        }
+        theme: { color: '#0dcaf0' },
       };
 
       const rzp = new (window as any).Razorpay(options);
@@ -192,281 +162,221 @@ export default function KioskPage() {
     }
   };
 
-  // -------------------------------------------------------------
-  // 1. SPLASH SCREEN COMPONENT
-  // -------------------------------------------------------------
+  // 1. SPLASH SCREEN
   if (showSplash) {
     return (
-      <div className="fixed inset-0 bg-black flex flex-col items-center justify-center z-50 text-white">
-        <video
-          autoPlay
-          muted
-          playsInline
-          className="w-full max-w-lg object-contain"
-          src="../../../../public/spy_logo.mp4"
-        />
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 1 }}
-          className="text-center mt-4"
-        >
-          <h1 className="text-3xl font-extrabold tracking-wide text-cyan-400">S.py</h1>
-          <p className="text-gray-400 text-sm tracking-widest mt-1">PRINTING WORLD</p>
-        </motion.div>
+      <div className="position-fixed top-0 start-0 w-100 h-100 bg-black d-flex flex-column align-items-center justify-content-center z-3 text-white">
+        <video autoPlay muted playsInline className="mw-100 mh-100" src="/spy-logo.mp4" />
+        <div className="text-center mt-3">
+          <h1 className="fw-bold text-info tracking-wide m-0">S.py</h1>
+          <p className="text-secondary small tracking-widest text-uppercase mt-1">Printing World</p>
+        </div>
       </div>
     );
   }
 
-  // -------------------------------------------------------------
-  // 2. MAIN DASHBOARD PAGE
-  // -------------------------------------------------------------
+  // 2. MAIN DASHBOARD
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center p-4 md:p-6">
+    <div className="min-vh-100 bg-dark text-light d-flex flex-column align-items-center p-3 p-md-4">
       {/* Top Header */}
-      <header className="w-full max-w-3xl flex flex-col items-center text-center border-b border-slate-800 pb-4 mb-6">
-        <div className="flex items-center space-x-2">
-          <div className="bg-cyan-500 text-slate-950 p-2 rounded-lg font-black text-xl">S.py</div>
-          <div className="text-left">
-            <h1 className="text-xl font-bold tracking-tight text-cyan-400">S.py - Printer World</h1>
-            <p className="text-xs text-slate-400">Instant Kiosk Autonomous Print System</p>
+      <header className="w-100 max-width-700 text-center border-bottom border-secondary pb-3 mb-4" style={{ maxWidth: '700px' }}>
+        <div className="d-flex align-items-center justify-content-center gap-2">
+          <div className="bg-info text-dark px-3 py-1 rounded fw-bold fs-4">S.py</div>
+          <div className="text-start">
+            <h1 className="h4 fw-bold text-info m-0">S.py - Printing World</h1>
+            <p className="small text-secondary m-0">Autonomous Print Kiosk</p>
           </div>
         </div>
 
         {/* Live Status Indicators */}
-        <div className="mt-4 w-full flex flex-wrap gap-2 justify-center text-xs font-semibold">
-          {/* Printer Internet Status */}
+        <div className="mt-3 d-flex flex-wrap justify-content-center gap-2">
           {!printerStatus?.pi_internet_online ? (
-            <div className="flex items-center space-x-1.5 bg-red-950/80 text-red-400 border border-red-800 px-3 py-1.5 rounded-full animate-pulse">
-              <WifiOff className="w-4 h-4" />
-              <span>No internet connectivity of printer with internet, please wait to establish the internet</span>
-            </div>
+            <span className="badge bg-danger text-wrap p-2 border border-danger">
+              <i className="bi bi-wifi-off me-1"></i> No internet connectivity of printer with internet, please wait to establish the internet
+            </span>
           ) : printerStatus.paper_remaining < 10 ? (
-            /* Paper Low Warning */
-            <div className="flex items-center space-x-1.5 bg-amber-950/80 text-amber-400 border border-amber-800 px-3 py-1.5 rounded-full">
-              <AlertTriangle className="w-4 h-4" />
-              <span>Paper count low: Please wait until refill</span>
-            </div>
+            <span className="badge bg-warning text-dark text-wrap p-2 border border-warning">
+              <i className="bi bi-exclamation-triangle-fill me-1"></i> Paper count low: Please wait until refill
+            </span>
           ) : (
-            /* All Systems Ready */
-            <div className="flex items-center space-x-1.5 bg-emerald-950/80 text-emerald-400 border border-emerald-800 px-3 py-1.5 rounded-full">
-              <CheckCircle2 className="w-4 h-4" />
-              <span>Printer Ready ({printerStatus.paper_remaining} pages remaining)</span>
-            </div>
+            <span className="badge bg-success text-wrap p-2 border border-success">
+              <i className="bi bi-check-circle-fill me-1"></i> Printer Ready ({printerStatus.paper_remaining} pages remaining)
+            </span>
           )}
         </div>
       </header>
 
-      {/* Main Container */}
-      <main className="w-full max-w-3xl flex-1">
-        <AnimatePresence mode="wait">
-          {step === 'upload' && (
-            <motion.div
-              key="upload-step"
-              initial={{ opacity: 0, y: 15 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -15 }}
-              className="space-y-6"
+      {/* Main Content */}
+      <main className="w-100" style={{ maxWidth: '700px' }}>
+        {step === 'upload' && (
+          <div className="d-flex flex-column gap-4">
+            {/* 4 Category Cards */}
+            <div className="row g-2">
+              {[
+                { id: 'PDF', label: 'Upload PDF', icon: 'bi-file-earmark-pdf-fill', color: 'btn-outline-danger' },
+                { id: 'IMAGE', label: 'Upload Image', icon: 'bi-file-earmark-image-fill', color: 'btn-outline-primary' },
+                { id: 'PPT', label: 'Upload PPT', icon: 'bi-file-earmark-slides-fill', color: 'btn-outline-warning' },
+                { id: 'DOC', label: 'Upload Doc', icon: 'bi-file-earmark-word-fill', color: 'btn-outline-info' },
+              ].map((cat) => (
+                <div className="col-6 col-md-3" key={cat.id}>
+                  <button
+                    onClick={() => {
+                      setSelectedCategory(cat.id as any);
+                      fileInputRef.current?.click();
+                    }}
+                    className={`btn ${selectedCategory === cat.id ? 'btn-info text-dark' : cat.color} w-100 p-3 d-flex flex-column align-items-center gap-2`}
+                  >
+                    <i className={`bi ${cat.icon} fs-3`}></i>
+                    <span className="small fw-semibold">{cat.label}</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="d-none"
+              accept={
+                selectedCategory === 'PDF' ? '.pdf' :
+                selectedCategory === 'IMAGE' ? 'image/*' :
+                selectedCategory === 'PPT' ? '.ppt,.pptx' : '.doc,.docx'
+              }
+              onChange={handleFileChange}
+            />
+
+            {/* Dropzone Trigger */}
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              className="border border-2 border-secondary border-dashed rounded-3 p-4 text-center cursor-pointer bg-body-tertiary"
+              style={{ cursor: 'pointer' }}
             >
-              {/* Category Cards Grid */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                {[
-                  { id: 'PDF', label: 'Upload PDF', icon: FileText, color: 'border-red-500/50 hover:border-red-500' },
-                  { id: 'IMAGE', label: 'Upload Image', icon: ImageIcon, color: 'border-blue-500/50 hover:border-blue-500' },
-                  { id: 'PPT', label: 'Upload PPT', icon: Presentation, color: 'border-orange-500/50 hover:border-orange-500' },
-                  { id: 'DOC', label: 'Upload Doc', icon: FileCode, color: 'border-indigo-500/50 hover:border-indigo-500' },
-                ].map((cat) => {
-                  const Icon = cat.icon;
-                  const isSelected = selectedCategory === cat.id;
-                  return (
-                    <button
-                      key={cat.id}
-                      onClick={() => {
-                        setSelectedCategory(cat.id as any);
-                        fileInputRef.current?.click();
-                      }}
-                      className={`p-4 rounded-xl border-2 transition-all flex flex-col items-center text-center space-y-2 bg-slate-900/60 backdrop-blur ${
-                        isSelected ? 'border-cyan-400 bg-cyan-950/30' : cat.color
-                      }`}
-                    >
-                      <Icon className={`w-8 h-8 ${isSelected ? 'text-cyan-400' : 'text-slate-300'}`} />
-                      <span className="text-xs font-semibold">{cat.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
+              <i className="bi bi-cloud-upload-fill text-info fs-1"></i>
+              <p className="mb-1 fw-semibold">
+                Click to select multiple <span className="text-info">{selectedCategory}</span> files
+              </p>
+              <p className="small text-secondary mb-0">Total batch upload limit: 350 MB</p>
+            </div>
 
-              {/* Hidden File Input */}
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                className="hidden"
-                accept={
-                  selectedCategory === 'PDF' ? '.pdf' :
-                  selectedCategory === 'IMAGE' ? 'image/*' :
-                  selectedCategory === 'PPT' ? '.ppt,.pptx' : '.doc,.docx'
-                }
-                onChange={handleFileChange}
-              />
-
-              {/* File Dropzone Trigger */}
-              <div 
-                onClick={() => fileInputRef.current?.click()}
-                className="border-2 border-dashed border-slate-700 hover:border-cyan-500 rounded-2xl p-8 text-center cursor-pointer bg-slate-900/30 transition-all flex flex-col items-center space-y-2"
-              >
-                <UploadCloud className="w-10 h-10 text-cyan-400 animate-bounce" />
-                <p className="text-sm font-medium text-slate-200">
-                  Click to select multiple <span className="text-cyan-400">{selectedCategory}</span> files
-                </p>
-                <p className="text-xs text-slate-400">Total batch upload limit: 350 MB</p>
-              </div>
-
-              {/* Selected Files List */}
-              {files.length > 0 && (
-                <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-                  <div className="flex justify-between items-center border-b border-slate-800 pb-2">
-                    <h3 className="text-sm font-bold text-slate-200">Selected Files ({files.length})</h3>
-                    <span className="text-xs text-slate-400">Size: {getTotalSizeMB()} / 350 MB</span>
-                  </div>
-
-                  <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                    {files.map((item) => (
-                      <div key={item.id} className="flex justify-between items-center bg-slate-950 p-2.5 rounded-lg border border-slate-800 text-xs">
-                        <div className="flex items-center space-x-2 truncate">
-                          <span className="bg-cyan-950 text-cyan-400 px-1.5 py-0.5 rounded font-mono font-bold">{item.category}</span>
-                          <span className="truncate font-medium text-slate-300">{item.file.name}</span>
-                        </div>
-                        <div className="flex items-center space-x-3">
-                          <span className="text-slate-400">{item.pageCount} page(s)</span>
-                          <button onClick={() => removeFile(item.id)} className="text-red-400 hover:text-red-300">
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
+            {/* Files List */}
+            {files.length > 0 && (
+              <div className="card bg-body-tertiary border-secondary">
+                <div className="card-header d-flex justify-content-between align-items-center border-secondary">
+                  <h6 className="mb-0 fw-bold">Selected Files ({files.length})</h6>
+                  <span className="small text-secondary">Size: {getTotalSizeMB()} / 350 MB</span>
+                </div>
+                <div className="card-body p-2" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                  {files.map((item) => (
+                    <div key={item.id} className="d-flex justify-content-between align-items-center bg-dark p-2 rounded mb-2 border border-secondary">
+                      <div className="d-flex align-items-center gap-2 text-truncate me-2">
+                        <span className="badge bg-info text-dark">{item.category}</span>
+                        <span className="small text-truncate">{item.file.name}</span>
                       </div>
-                    ))}
-                  </div>
-
-                  {/* Proceed to Print Preview */}
+                      <div className="d-flex align-items-center gap-3">
+                        <span className="small text-secondary">{item.pageCount} pg</span>
+                        <button onClick={() => removeFile(item.id)} className="btn btn-sm btn-outline-danger border-0">
+                          <i className="bi bi-trash-fill"></i>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="card-footer border-secondary">
                   <button
                     onClick={() => setStep('checkout')}
                     disabled={!printerStatus?.pi_internet_online || printerStatus?.paper_remaining < 1}
-                    className="w-full py-3 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 font-bold rounded-xl text-slate-950 flex items-center justify-center space-x-2 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="btn btn-info text-dark fw-bold w-100 py-2"
                   >
-                    <Printer className="w-5 h-5" />
-                    <span>Proceed to Print Preview</span>
+                    <i className="bi bi-printer-fill me-2"></i> Proceed to Print Preview
                   </button>
                 </div>
-              )}
-            </motion.div>
-          )}
+              </div>
+            )}
+          </div>
+        )}
 
-          {/* -------------------------------------------------------------
-              3. PREVIEW & BREAKDOWN PAGE
-             ------------------------------------------------------------- */}
-          {step === 'checkout' && (
-            <motion.div
-              key="checkout-step"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              className="space-y-6"
-            >
-              <button 
-                onClick={() => setStep('upload')}
-                className="flex items-center space-x-1 text-xs text-slate-400 hover:text-slate-200"
-              >
-                <ArrowLeft className="w-4 h-4" />
-                <span>Back to File Upload</span>
-              </button>
+        {/* 3. CHECKOUT */}
+        {step === 'checkout' && (
+          <div className="d-flex flex-column gap-3">
+            <button onClick={() => setStep('upload')} className="btn btn-link text-secondary text-decoration-none p-0 text-start">
+              <i className="bi bi-arrow-left me-1"></i> Back to File Upload
+            </button>
 
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
-                <h2 className="text-lg font-bold text-cyan-400">Final Print Breakdown</h2>
-
-                <div className="space-y-2 border-b border-slate-800 pb-4 text-sm">
-                  <div className="flex justify-between text-slate-400">
-                    <span>Total Files Selected:</span>
-                    <span className="text-slate-200 font-semibold">{files.length}</span>
-                  </div>
-                  <div className="flex justify-between text-slate-400">
-                    <span>Total Calculated Pages:</span>
-                    <span className="text-slate-200 font-semibold">{getTotalPages()} Pages</span>
-                  </div>
-                  <div className="flex justify-between text-slate-400">
-                    <span>Rate Per Page:</span>
-                    <span className="text-slate-200 font-semibold">₹{COST_PER_PAGE}.00 / page</span>
-                  </div>
+            <div className="card bg-body-tertiary border-secondary">
+              <div className="card-body">
+                <h5 className="card-title text-info fw-bold mb-3">Final Print Breakdown</h5>
+                <div className="d-flex justify-between border-bottom border-secondary pb-2 mb-2">
+                  <span className="text-secondary">Total Files Selected:</span>
+                  <span className="fw-semibold">{files.length}</span>
+                </div>
+                <div className="d-flex justify-between border-bottom border-secondary pb-2 mb-2">
+                  <span className="text-secondary">Total Calculated Pages:</span>
+                  <span className="fw-semibold">{getTotalPages()} Pages</span>
+                </div>
+                <div className="d-flex justify-between border-bottom border-secondary pb-2 mb-3">
+                  <span className="text-secondary">Rate Per Page:</span>
+                  <span className="fw-semibold">₹{COST_PER_PAGE}.00 / page</span>
                 </div>
 
-                <div className="flex justify-between items-center text-lg font-black text-slate-100">
-                  <span>Total Payable Amount:</span>
-                  <span className="text-2xl text-emerald-400">₹{getTotalCost()}.00</span>
+                <div className="d-flex justify-content-between align-items-center mb-3">
+                  <span className="h6 mb-0">Total Payable Amount:</span>
+                  <span className="h4 text-success fw-bold mb-0">₹{getTotalCost()}.00</span>
                 </div>
 
-                {/* Razorpay Pay Button */}
                 <button
                   onClick={handleRazorpayPayment}
                   disabled={isProcessingPayment}
-                  className="w-full py-3.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-xl flex items-center justify-center space-x-2 transition-all"
+                  className="btn btn-success fw-bold w-100 py-2"
                 >
-                  <CreditCard className="w-5 h-5" />
-                  <span>{isProcessingPayment ? 'Connecting Razorpay...' : `Pay ₹${getTotalCost()}.00 Now`}</span>
+                  <i className="bi bi-credit-card-fill me-2"></i>
+                  {isProcessingPayment ? 'Connecting Razorpay...' : `Pay ₹${getTotalCost()}.00 Now`}
                 </button>
               </div>
+            </div>
 
-              {/* Live Waiting Queue Section */}
-              <div className="bg-slate-900/50 border border-slate-800/80 rounded-2xl p-4">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">
+            {/* Queue Section */}
+            <div className="card bg-dark border-secondary">
+              <div className="card-body">
+                <h6 className="card-subtitle mb-2 text-secondary text-uppercase small">
                   Live Printer Queue ({activeQueue.length} ahead of you)
-                </h3>
+                </h6>
                 {activeQueue.length === 0 ? (
-                  <p className="text-xs text-slate-500 italic">No one in line. Your job will print immediately after payment!</p>
+                  <p className="small text-muted italic mb-0">No one in line. Your job will print immediately after payment!</p>
                 ) : (
-                  <div className="space-y-2 max-h-36 overflow-y-auto">
+                  <div className="d-flex flex-column gap-2" style={{ maxHeight: '150px', overflowY: 'auto' }}>
                     {activeQueue.map((q, idx) => (
-                      <div key={idx} className="flex justify-between items-center text-xs bg-slate-950 p-2 rounded border border-slate-800/50 text-slate-400">
-                        <span className="truncate">{q.file_name}</span>
-                        <span className="font-semibold text-cyan-400">{q.pages_count} pages</span>
+                      <div key={idx} className="d-flex justify-content-between align-items-center small bg-body-tertiary p-2 rounded border border-secondary">
+                        <span className="text-truncate">{q.file_name}</span>
+                        <span className="badge bg-info text-dark">{q.pages_count} pages</span>
                       </div>
                     ))}
                   </div>
                 )}
               </div>
-            </motion.div>
-          )}
+            </div>
+          </div>
+        )}
 
-          {/* -------------------------------------------------------------
-              4. SUCCESS & CONTINUE PRINTING PAGE
-             ------------------------------------------------------------- */}
-          {step === 'success' && (
-            <motion.div
-              key="success-step"
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              className="bg-slate-900 border border-slate-800 rounded-2xl p-8 text-center space-y-6"
-            >
-              <div className="w-16 h-16 bg-emerald-950 text-emerald-400 border border-emerald-800 rounded-full flex items-center justify-center mx-auto">
-                <CheckCircle2 className="w-10 h-10 animate-pulse" />
-              </div>
-
-              <div>
-                <h2 className="text-2xl font-bold text-slate-100">Payment Successful!</h2>
-                <p className="text-cyan-400 text-sm font-medium mt-1">Your print is getting ready on the printer...</p>
-              </div>
-
+        {/* 4. SUCCESS */}
+        {step === 'success' && (
+          <div className="card bg-body-tertiary border-secondary text-center p-4">
+            <div className="card-body">
+              <i className="bi bi-check-circle-fill text-success fs-1 mb-3"></i>
+              <h3 className="fw-bold">Payment Successful!</h3>
+              <p className="text-info mb-4">Your print is getting ready on the printer...</p>
               <button
                 onClick={() => {
                   setFiles([]);
                   setStep('upload');
                 }}
-                className="w-full py-3 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-xl flex items-center justify-center space-x-2 transition-all"
+                className="btn btn-info text-dark fw-bold w-100 py-2"
               >
-                <RotateCcw className="w-4 h-4" />
-                <span>Continue to Print More</span>
+                <i className="bi bi-arrow-repeat me-2"></i> Continue to Print More
               </button>
-            </motion.div>
-          )}
-        </AnimatePresence>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
