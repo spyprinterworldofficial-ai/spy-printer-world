@@ -9,13 +9,14 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.112.0",
+    "@supabase/supabase-js": "^2.112.2",
     "bootstrap": "^5.3.8",
     "bootstrap-icons": "^1.13.1",
     "canvas-confetti": "^1.9.4",
     "framer-motion": "^12.43.0",
     "lucide-react": "^1.28.0",
     "next": "16.3.0",
+    "pdfjs-dist": "^6.2.108",
     "razorpay": "^2.9.8",
     "react": "19.2.8",
     "react-dom": "19.2.8"
