@@ -40,21 +40,20 @@ interface QueueItem {
   created_at: string;
 }
 
-const CATEGORY_META: Record<Category, { label: string; icon: string; color: string; accept: string }> = {
-  PDF: { label: 'Upload PDF', icon: 'bi-file-earmark-pdf-fill', color: 'btn-outline-danger', accept: '.pdf' },
-  IMAGE: { label: 'Upload Image', icon: 'bi-file-earmark-image-fill', color: 'btn-outline-primary', accept: 'image/*' },
-  PPT: { label: 'Upload PPT', icon: 'bi-file-earmark-slides-fill', color: 'btn-outline-warning', accept: '.ppt,.pptx' },
-  DOC: { label: 'Upload Doc', icon: 'bi-file-earmark-word-fill', color: 'btn-outline-info', accept: '.doc,.docx' },
+const CATEGORY_META: Record<Category, { label: string; icon: string; gradient: string; accept: string }> = {
+  PDF: { label: 'PDF', icon: 'bi-file-earmark-pdf-fill', gradient: 'linear-gradient(135deg,#ff5f6d,#c31432)', accept: '.pdf' },
+  IMAGE: { label: 'Image', icon: 'bi-file-earmark-image-fill', gradient: 'linear-gradient(135deg,#36d1dc,#5b86e5)', accept: 'image/*' },
+  PPT: { label: 'PPT', icon: 'bi-file-earmark-slides-fill', gradient: 'linear-gradient(135deg,#f7971e,#ffd200)', accept: '.ppt,.pptx' },
+  DOC: { label: 'Doc', icon: 'bi-file-earmark-word-fill', gradient: 'linear-gradient(135deg,#00c6ff,#0072ff)', accept: '.doc,.docx' },
 };
 
 // ---- Page counting -------------------------------------------------------
 // PDFs: counted exactly via pdf.js.
 // Images: always 1 page.
-// PPT / DOC: there is no reliable way to get an exact page/slide count in
-// the browser without a full renderer. We estimate from file size and flag
-// it as an estimate in the UI. For accurate billing, confirm the real count
-// server-side (e.g. a LibreOffice headless conversion step on the Pi or a
-// small serverless function) before charging, or reconcile after printing.
+// PPT / DOC: no reliable exact count in-browser without a full renderer, so
+// we estimate from file size and flag it as an estimate in the UI. For
+// exact billing, confirm the real count server-side before charging (e.g. a
+// LibreOffice headless conversion step), or reconcile after printing.
 
 async function getPdfPageCount(file: File): Promise<number> {
   const pdfjsLib = await import('pdfjs-dist');
@@ -92,8 +91,15 @@ export default function KioskPage() {
 
   const [showSplash, setShowSplash] = useState(true);
   const [videoFailed, setVideoFailed] = useState(false);
+
+  // Printer status loading is tracked explicitly so we never confuse
+  // "still loading" or "failed to load" with "printer is offline" — that
+  // mix-up was previously leaving every button permanently disabled.
   const [printerStatus, setPrinterStatus] = useState<PrinterStatus | null>(null);
-  const [selectedCategory, setSelectedCategory] = useState<Category>('PDF');
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [statusError, setStatusError] = useState<string | null>(null);
+
+  const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [step, setStep] = useState<'upload' | 'checkout' | 'success'>('upload');
 
@@ -105,13 +111,11 @@ export default function KioskPage() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Splash screen: hide after the video ends, or after a max wait, or if it fails to load.
   useEffect(() => {
     const maxWait = setTimeout(() => setShowSplash(false), 4500);
     return () => clearTimeout(maxWait);
   }, []);
 
-  // Load the Razorpay checkout script once.
   useEffect(() => {
     if (document.getElementById('razorpay-checkout-js')) return;
     const script = document.createElement('script');
@@ -136,12 +140,23 @@ export default function KioskPage() {
     if (!printerId) return;
 
     const fetchStatus = async () => {
+      setStatusLoading(true);
+      setStatusError(null);
       const { data, error } = await supabase
         .from('printers')
         .select('*')
         .eq('id', printerId)
         .single();
-      if (!error && data) setPrinterStatus(data as PrinterStatus);
+
+      if (error) {
+        // Full detail stays in the console for debugging; end users just
+        // see a plain, non-technical message.
+        console.error('Failed to load printer status (check NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY in Vercel):', error);
+        setStatusError('Printer is not connected. Please wait.');
+      } else if (data) {
+        setPrinterStatus(data as PrinterStatus);
+      }
+      setStatusLoading(false);
     };
 
     fetchStatus();
@@ -166,8 +181,13 @@ export default function KioskPage() {
     };
   }, [printerId, fetchQueue]);
 
+  const openPicker = (cat: Category) => {
+    setSelectedCategory(cat);
+    setTimeout(() => fileInputRef.current?.click(), 0);
+  };
+
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files || e.target.files.length === 0) return;
+    if (!e.target.files || e.target.files.length === 0 || !selectedCategory) return;
     setErrorMsg(null);
 
     const newFiles = Array.from(e.target.files);
@@ -180,20 +200,21 @@ export default function KioskPage() {
       return;
     }
 
+    const category = selectedCategory;
     const processed: UploadedFile[] = [];
     for (const file of newFiles) {
-      const { pageCount, estimated } = await resolvePageCount(file, selectedCategory);
+      const { pageCount, estimated } = await resolvePageCount(file, category);
       processed.push({
         id: Math.random().toString(36).slice(2),
         file,
-        category: selectedCategory,
+        category,
         pageCount,
         estimated,
       });
     }
 
     setFiles((prev) => [...prev, ...processed]);
-    e.target.value = ''; // allow re-selecting the same file later
+    e.target.value = '';
   };
 
   const removeFile = (id: string) => {
@@ -204,8 +225,6 @@ export default function KioskPage() {
   const getTotalCost = () => getTotalPages() * COST_PER_PAGE;
   const getTotalSizeMB = () => (files.reduce((acc, f) => acc + f.file.size, 0) / (1024 * 1024)).toFixed(2);
 
-  // Upload every selected file to Supabase Storage and create a PENDING
-  // print_jobs row for each. Runs when the user moves to the checkout step.
   const handleProceedToCheckout = async () => {
     setErrorMsg(null);
     setIsUploading(true);
@@ -288,7 +307,9 @@ export default function KioskPage() {
             setStep('success');
           } catch (err) {
             console.error(err);
-            setErrorMsg('Payment went through but verification failed. Please contact support with your payment ID: ' + response.razorpay_payment_id);
+            setErrorMsg(
+              'Payment went through but verification failed. Please contact support with your payment ID: ' + response.razorpay_payment_id
+            );
           } finally {
             setIsProcessingPayment(false);
           }
@@ -317,13 +338,15 @@ export default function KioskPage() {
   const resetToUpload = () => {
     setFiles([]);
     setPendingJobIds([]);
+    setSelectedCategory(null);
     setStep('upload');
   };
 
-  // 1. SPLASH SCREEN
+  // 1. SPLASH SCREEN — video only. If the video fails to load, fall back to
+  // the logo image alone (still no extra text) rather than a broken screen.
   if (showSplash) {
     return (
-      <div className="position-fixed top-0 start-0 w-100 h-100 bg-black d-flex flex-column align-items-center justify-content-center z-3 text-white">
+      <div className="splash-screen position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center">
         {!videoFailed ? (
           <video
             autoPlay
@@ -336,150 +359,169 @@ export default function KioskPage() {
             onError={() => setVideoFailed(true)}
           />
         ) : (
-          <div className="bg-info text-dark px-4 py-3 rounded fw-bold fs-1">S.py</div>
+          /* eslint-disable-next-line @next/next/no-img-element */
+          <img src="/spy-logo.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
         )}
-        <div className="text-center mt-3">
-          <h1 className="fw-bold text-info m-0" style={{ letterSpacing: '2px' }}>S.py</h1>
-          <p className="text-secondary small text-uppercase mt-1" style={{ letterSpacing: '3px' }}>Printing World</p>
-        </div>
+        <style jsx global>{splashStyles}</style>
       </div>
     );
   }
 
-  const printerOffline = !printerStatus?.pi_internet_online;
+  // While we don't yet know the printer's status, don't claim it's offline —
+  // just show a neutral "checking" state and keep buttons disabled only
+  // for that reason (with a spinner), not silently forever.
+  const printerOffline = !statusLoading && !statusError && !printerStatus?.pi_internet_online;
   const lowPaper = !!printerStatus && printerStatus.paper_remaining < LOW_PAPER_THRESHOLD;
   const printerDisabled = !!printerStatus && !printerStatus.is_enabled;
-  const canUpload = !printerOffline && !lowPaper && !printerDisabled;
+  const canUpload = !statusLoading && !statusError && !printerOffline && !lowPaper && !printerDisabled;
 
   // 2. MAIN DASHBOARD
   return (
-    <div className="min-vh-100 bg-dark text-light d-flex flex-column align-items-center p-3 p-md-4">
-      <header className="w-100 text-center border-bottom border-secondary pb-3 mb-4" style={{ maxWidth: '700px' }}>
-        <div className="d-flex align-items-center justify-content-center gap-2">
-          <div className="bg-info text-dark px-3 py-1 rounded fw-bold fs-4">S.py</div>
-          <div className="text-start">
-            <h1 className="h4 fw-bold text-info m-0">S.py - Printing World</h1>
-            <p className="small text-secondary m-0">Autonomous Print Kiosk</p>
-          </div>
+    <div className="kiosk-bg min-vh-100 text-light d-flex flex-column align-items-center p-3 p-md-4">
+      <header className="w-100 text-center pb-3 mb-4" style={{ maxWidth: '720px' }}>
+        <div className="d-flex align-items-center justify-content-start">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/spy-logo.png" alt="S.py Printing World" style={{ height: '64px', width: 'auto' }} />
         </div>
 
         <div className="mt-3 d-flex flex-wrap justify-content-center gap-2">
-          {printerOffline ? (
-            <span className="badge bg-danger text-wrap p-2 border border-danger">
+          {statusLoading ? (
+            <span className="status-pill status-pill-neutral">
+              <span className="spinner-border spinner-border-sm me-2" role="status" />
+              Checking printer status...
+            </span>
+          ) : statusError ? (
+            <span className="text-danger small fw-semibold">{statusError}</span>
+          ) : printerOffline ? (
+            <span className="status-pill status-pill-red">
               <i className="bi bi-wifi-off me-1"></i> No internet connectivity of printer, please wait to establish the internet
             </span>
           ) : printerDisabled ? (
-            <span className="badge bg-secondary text-wrap p-2 border border-secondary">
+            <span className="status-pill status-pill-neutral">
               <i className="bi bi-pause-circle-fill me-1"></i> Printer temporarily disabled by admin
             </span>
           ) : lowPaper ? (
-            <span className="badge bg-warning text-dark text-wrap p-2 border border-warning">
+            <span className="status-pill status-pill-amber">
               <i className="bi bi-exclamation-triangle-fill me-1"></i> Paper count low: Please wait until refill
             </span>
-          ) : printerStatus ? (
-            <span className="badge bg-success text-wrap p-2 border border-success">
-              <i className="bi bi-check-circle-fill me-1"></i> Printer Ready ({printerStatus.paper_remaining} pages remaining)
-            </span>
           ) : (
-            <span className="badge bg-secondary text-wrap p-2 border border-secondary">
-              <i className="bi bi-hourglass-split me-1"></i> Checking printer status...
+            <span className="status-pill status-pill-green">
+              <i className="bi bi-check-circle-fill me-1"></i> Printer Ready ({printerStatus?.paper_remaining} pages remaining)
             </span>
           )}
         </div>
       </header>
 
       {errorMsg && (
-        <div className="alert alert-danger w-100" style={{ maxWidth: '700px' }} role="alert">
+        <div className="alert alert-danger w-100" style={{ maxWidth: '720px' }} role="alert">
           {errorMsg}
         </div>
       )}
 
-      <main className="w-100" style={{ maxWidth: '700px' }}>
+      <main className="w-100" style={{ maxWidth: '720px' }}>
         {step === 'upload' && (
           <div className="d-flex flex-column gap-4">
-            <div className="row g-2">
-              {(Object.keys(CATEGORY_META) as Category[]).map((cat) => {
-                const meta = CATEGORY_META[cat];
-                return (
-                  <div className="col-6 col-md-3" key={cat}>
-                    <button
-                      disabled={!canUpload}
-                      onClick={() => {
-                        setSelectedCategory(cat);
-                        fileInputRef.current?.click();
-                      }}
-                      className={`btn ${selectedCategory === cat ? 'btn-info text-dark' : meta.color} w-100 p-3 d-flex flex-column align-items-center gap-2`}
-                    >
-                      <i className={`bi ${meta.icon} fs-3`}></i>
-                      <span className="small fw-semibold">{meta.label}</span>
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+            {!selectedCategory && (
+              <>
+                <p className="text-center text-secondary small mb-0">Choose what you'd like to print</p>
+                <div className="row g-3">
+                  {(Object.keys(CATEGORY_META) as Category[]).map((cat) => {
+                    const meta = CATEGORY_META[cat];
+                    return (
+                      <div className="col-6 col-md-3" key={cat}>
+                        <button
+                          disabled={!canUpload}
+                          onClick={() => openPicker(cat)}
+                          className="category-card w-100 p-3 d-flex flex-column align-items-center gap-2 border-0"
+                          style={{ background: meta.gradient }}
+                        >
+                          <i className={`bi ${meta.icon} fs-2`}></i>
+                          <span className="small fw-semibold">Upload {meta.label}</span>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
 
             <input
               ref={fileInputRef}
               type="file"
               multiple
               className="d-none"
-              accept={CATEGORY_META[selectedCategory].accept}
+              accept={selectedCategory ? CATEGORY_META[selectedCategory].accept : undefined}
               onChange={handleFileChange}
             />
 
-            <div
-              onClick={() => canUpload && fileInputRef.current?.click()}
-              className="border border-2 border-secondary border-dashed rounded-3 p-4 text-center bg-body-tertiary"
-              style={{ cursor: canUpload ? 'pointer' : 'not-allowed', opacity: canUpload ? 1 : 0.5 }}
-            >
-              <i className="bi bi-cloud-upload-fill text-info fs-1"></i>
-              <p className="mb-1 fw-semibold">
-                Click to select multiple <span className="text-info">{selectedCategory}</span> files
-              </p>
-              <p className="small text-secondary mb-0">Total batch upload limit: 350 MB</p>
-            </div>
-
-            {files.length > 0 && (
-              <div className="card bg-body-tertiary border-secondary">
+            {selectedCategory && (
+              <div className="card kiosk-card">
                 <div className="card-header d-flex justify-content-between align-items-center border-secondary">
-                  <h6 className="mb-0 fw-bold">Selected Files ({files.length})</h6>
-                  <span className="small text-secondary">Size: {getTotalSizeMB()} / 350 MB</span>
-                </div>
-                <div className="card-body p-2" style={{ maxHeight: '200px', overflowY: 'auto' }}>
-                  {files.map((item) => (
-                    <div key={item.id} className="d-flex justify-content-between align-items-center bg-dark p-2 rounded mb-2 border border-secondary">
-                      <div className="d-flex align-items-center gap-2 text-truncate me-2">
-                        <span className="badge bg-info text-dark">{item.category}</span>
-                        <span className="small text-truncate">{item.file.name}</span>
-                      </div>
-                      <div className="d-flex align-items-center gap-3">
-                        <span className="small text-secondary">
-                          {item.pageCount} pg{item.estimated ? ' (est.)' : ''}
-                        </span>
-                        <button onClick={() => removeFile(item.id)} className="btn btn-sm btn-outline-danger border-0">
-                          <i className="bi bi-trash-fill"></i>
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div className="card-footer border-secondary">
+                  <div className="d-flex align-items-center gap-2">
+                    <i className={`bi ${CATEGORY_META[selectedCategory].icon} text-info`}></i>
+                    <h6 className="mb-0 fw-bold">
+                      {files.length > 0 ? `Selected Files (${files.length})` : `Add your ${CATEGORY_META[selectedCategory].label} files`}
+                    </h6>
+                  </div>
                   <button
-                    onClick={handleProceedToCheckout}
-                    disabled={!canUpload || isUploading}
-                    className="btn btn-info text-dark fw-bold w-100 py-2"
+                    onClick={() => {
+                      setSelectedCategory(null);
+                      setFiles([]);
+                    }}
+                    className="btn btn-sm btn-outline-secondary border-0"
                   >
-                    {isUploading ? (
-                      <>
-                        <span className="spinner-border spinner-border-sm me-2" role="status" />
-                        Uploading files...
-                      </>
-                    ) : (
-                      <>
-                        <i className="bi bi-printer-fill me-2"></i> Proceed to Print Preview
-                      </>
-                    )}
+                    <i className="bi bi-arrow-repeat me-1"></i> Change type
                   </button>
+                </div>
+
+                {files.length > 0 && (
+                  <div className="card-body p-2" style={{ maxHeight: '220px', overflowY: 'auto' }}>
+                    {files.map((item) => (
+                      <div key={item.id} className="d-flex justify-content-between align-items-center file-row p-2 rounded mb-2">
+                        <div className="d-flex align-items-center gap-2 text-truncate me-2">
+                          <span className="badge bg-info text-dark">{item.category}</span>
+                          <span className="small text-truncate">{item.file.name}</span>
+                        </div>
+                        <div className="d-flex align-items-center gap-3">
+                          <span className="small text-secondary">
+                            {item.pageCount} pg{item.estimated ? ' (est.)' : ''}
+                          </span>
+                          <button onClick={() => removeFile(item.id)} className="btn btn-sm btn-outline-danger border-0">
+                            <i className="bi bi-trash-fill"></i>
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="card-footer border-secondary d-flex flex-column gap-2">
+                  <button onClick={() => openPicker(selectedCategory)} className="btn btn-outline-info fw-semibold w-100 py-2">
+                    <i className="bi bi-plus-lg me-2"></i>
+                    {files.length > 0 ? `Add more ${CATEGORY_META[selectedCategory].label} files` : `Select ${CATEGORY_META[selectedCategory].label} files`}
+                  </button>
+
+                  {files.length > 0 && (
+                    <>
+                      <div className="text-end small text-secondary">Size: {getTotalSizeMB()} / 350 MB</div>
+                      <button
+                        onClick={handleProceedToCheckout}
+                        disabled={!canUpload || isUploading}
+                        className="btn btn-print fw-bold w-100 py-2"
+                      >
+                        {isUploading ? (
+                          <>
+                            <span className="spinner-border spinner-border-sm me-2" role="status" />
+                            Uploading files...
+                          </>
+                        ) : (
+                          <>
+                            <i className="bi bi-printer-fill me-2"></i> Proceed to Print Preview
+                          </>
+                        )}
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             )}
@@ -496,7 +538,7 @@ export default function KioskPage() {
               <i className="bi bi-arrow-left me-1"></i> Back to File Upload
             </button>
 
-            <div className="card bg-body-tertiary border-secondary">
+            <div className="card kiosk-card">
               <div className="card-body">
                 <h5 className="card-title text-info fw-bold mb-3">Final Print Breakdown</h5>
                 <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-2">
@@ -537,7 +579,7 @@ export default function KioskPage() {
               </div>
             </div>
 
-            <div className="card bg-dark border-secondary">
+            <div className="card kiosk-card">
               <div className="card-body">
                 <h6 className="card-subtitle mb-2 text-secondary text-uppercase small">
                   Live Printer Queue ({activeQueue.length} ahead of you)
@@ -547,7 +589,7 @@ export default function KioskPage() {
                 ) : (
                   <div className="d-flex flex-column gap-2" style={{ maxHeight: '150px', overflowY: 'auto' }}>
                     {activeQueue.map((q) => (
-                      <div key={q.id} className="d-flex justify-content-between align-items-center small bg-body-tertiary p-2 rounded border border-secondary">
+                      <div key={q.id} className="d-flex justify-content-between align-items-center small file-row p-2 rounded">
                         <span className="text-truncate">{q.file_name}</span>
                         <span className="badge bg-info text-dark">{q.pages_count} pages</span>
                       </div>
@@ -560,18 +602,102 @@ export default function KioskPage() {
         )}
 
         {step === 'success' && (
-          <div className="card bg-body-tertiary border-secondary text-center p-4">
+          <div className="card kiosk-card text-center p-4">
             <div className="card-body">
               <i className="bi bi-check-circle-fill text-success fs-1 mb-3"></i>
               <h3 className="fw-bold">Payment Successful!</h3>
               <p className="text-info mb-4">Your print is getting ready on the printer...</p>
-              <button onClick={resetToUpload} className="btn btn-info text-dark fw-bold w-100 py-2">
+              <button onClick={resetToUpload} className="btn btn-print fw-bold w-100 py-2">
                 <i className="bi bi-arrow-repeat me-2"></i> Continue to Print More
               </button>
             </div>
           </div>
         )}
       </main>
+      <style jsx global>{dashboardStyles}</style>
     </div>
   );
 }
+
+const splashStyles = `
+  .splash-screen {
+    background: radial-gradient(circle at 50% 40%, #101820 0%, #000000 80%);
+  }
+  .logo-badge {
+    background: linear-gradient(135deg, #36d1dc, #0dcaf0);
+    color: #041019;
+    border-radius: 10px;
+  }
+  .spy-gradient-text {
+    background: linear-gradient(90deg, #36d1dc, #5b86e5);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+`;
+
+const dashboardStyles = `
+  .kiosk-bg {
+    background: radial-gradient(circle at 50% 0%, #172029 0%, #0a0e12 60%);
+  }
+  .logo-badge {
+    background: linear-gradient(135deg, #36d1dc, #0dcaf0);
+    color: #041019;
+    border-radius: 10px;
+  }
+  .spy-gradient-text {
+    background: linear-gradient(90deg, #36d1dc, #5b86e5);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.5rem 0.9rem;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }
+  .status-pill-green { background: rgba(25,135,84,0.15); color: #4ade80; border-color: rgba(25,135,84,0.4); }
+  .status-pill-red { background: rgba(220,53,69,0.15); color: #f87171; border-color: rgba(220,53,69,0.4); }
+  .status-pill-amber { background: rgba(255,193,7,0.15); color: #fbbf24; border-color: rgba(255,193,7,0.4); }
+  .status-pill-neutral { background: rgba(148,163,184,0.15); color: #cbd5e1; border-color: rgba(148,163,184,0.35); }
+
+  .category-card {
+    border-radius: 16px;
+    color: #fff;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+  }
+  .category-card:hover:not(:disabled) {
+    transform: translateY(-4px);
+    box-shadow: 0 12px 26px rgba(0,0,0,0.45);
+  }
+  .category-card:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .kiosk-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
+    backdrop-filter: blur(6px);
+  }
+  .file-row {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .btn-print {
+    background: linear-gradient(135deg, #36d1dc, #5b86e5);
+    border: none;
+    color: #041019;
+  }
+  .btn-print:hover {
+    filter: brightness(1.08);
+    color: #041019;
+  }
+`;
