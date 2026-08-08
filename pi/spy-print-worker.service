@@ -1,0 +1,18 @@
+[Unit]
+Description=S.py Print Worker
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and WorkingDirectory to match wherever you clone the project
+# on the Pi. If your Linux username isn't "pi", change that too.
+User=pi
+WorkingDirectory=/home/pi/APrinter/pi
+EnvironmentFile=/home/pi/APrinter/pi/.env
+ExecStart=/home/pi/APrinter/pi/venv/bin/python /home/pi/APrinter/pi/print_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
