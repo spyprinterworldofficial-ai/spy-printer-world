@@ -354,13 +354,13 @@ export default function KioskPage() {
             playsInline
             preload="auto"
             className="mw-100 mh-100"
-            src="../../../../public/spy_logo.mp4"
+            src="/spy_logo.mp4"
             onEnded={() => setShowSplash(false)}
             onError={() => setVideoFailed(true)}
           />
         ) : (
           /* eslint-disable-next-line @next/next/no-img-element */
-          <img src="../../../../public/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
+          <img src="/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
         )}
         <style jsx global>{splashStyles}</style>
       </div>
@@ -381,7 +381,7 @@ export default function KioskPage() {
       <header className="w-100 text-center pb-3 mb-4" style={{ maxWidth: '720px' }}>
         <div className="d-flex align-items-center justify-content-start">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="../../../../public/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ height: '64px', width: 'auto' }} />
+          <img src="/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ height: '64px', width: 'auto' }} />
         </div>
 
         <div className="mt-3 d-flex flex-wrap justify-content-center gap-2">
