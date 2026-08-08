@@ -111,9 +111,13 @@ export default function KioskPage() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Splash hides when the video actually finishes (onEnded below). This
+  // safety-net timeout only exists in case autoplay gets silently blocked
+  // by the browser and 'ended' never fires — it's deliberately much longer
+  // than the video itself so it never cuts a normal playthrough short.
   useEffect(() => {
-    const maxWait = setTimeout(() => setShowSplash(false), 4500);
-    return () => clearTimeout(maxWait);
+    const safetyNet = setTimeout(() => setShowSplash(false), 20000);
+    return () => clearTimeout(safetyNet);
   }, []);
 
   useEffect(() => {
@@ -360,7 +364,7 @@ export default function KioskPage() {
           />
         ) : (
           /* eslint-disable-next-line @next/next/no-img-element */
-          <img src="/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
+          <img src="/spy-logo.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
         )}
         <style jsx global>{splashStyles}</style>
       </div>
@@ -381,7 +385,7 @@ export default function KioskPage() {
       <header className="w-100 text-center pb-3 mb-4" style={{ maxWidth: '720px' }}>
         <div className="d-flex align-items-center justify-content-start">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/Screenshot 2026-08-05 012139.png" alt="S.py Printing World" style={{ height: '64px', width: 'auto' }} />
+          <img src="/spy-logo.png" alt="S.py Printing World" style={{ height: '64px', width: 'auto' }} />
         </div>
 
         <div className="mt-3 d-flex flex-wrap justify-content-center gap-2">
