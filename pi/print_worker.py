@@ -159,13 +159,31 @@ def print_file(pdf_or_image_path: Path, copies: int):
     )
 
 
+def upload_converted_pdf(pdf_path: Path, original_storage_path: str) -> str:
+    """Uploads the PDF produced during counting back to Storage, so printing
+    later can reuse this exact file instead of converting again — see the
+    comment on convert_to_pdf for why that determinism matters."""
+    converted_path = f"{original_storage_path}.converted.pdf"
+    with open(pdf_path, "rb") as f:
+        supabase.storage.from_(STORAGE_BUCKET).upload(
+            converted_path, f, file_options={"upsert": "true"}
+        )
+    return converted_path
+
+
 def process_counting_job(job: dict):
     """Converts a PPT/DOC to find its exact page count, then writes the
     real pages_count + amount_paid back and flips the job to PENDING
-    (ready for checkout). Guards every write with .eq('status', 'COUNTING')
-    so that if the website deleted this job in the meantime (person removed
-    the file before we finished), the update simply matches zero rows
-    instead of resurrecting a row the person already discarded."""
+    (ready for checkout). The converted PDF is uploaded back to Storage
+    (converted_pdf_path) so that printing later reuses this exact file
+    instead of re-converting — guaranteeing the pages someone paid for are
+    exactly the pages that get printed, not a second, possibly slightly
+    different, conversion of the same source file.
+
+    Every write here is guarded with .eq('status', 'COUNTING') so that if
+    the website deleted this job in the meantime (person removed the file
+    before we finished), the update simply matches zero rows instead of
+    resurrecting a row the person already discarded."""
     job_id = job["id"]
     file_name = job["file_name"]
     storage_path = job["storage_path"]
@@ -179,12 +197,14 @@ def process_counting_job(job: dict):
         download_job_file(storage_path, local_path)
         pdf_path = convert_to_pdf(local_path, workdir)
         pages = get_pdf_page_count(pdf_path)
+        converted_pdf_path = upload_converted_pdf(pdf_path, storage_path)
 
     amount = pages * copies * COST_PER_PAGE
     supabase.table("print_jobs").update({
         "pages_count": pages,
         "amount_paid": amount,
         "status": "PENDING",
+        "converted_pdf_path": converted_pdf_path,
     }).eq("id", job_id).eq("status", "COUNTING").execute()
     print(f"[count {job_id}] done: {pages} pages, Rs.{amount}")
 
@@ -194,6 +214,7 @@ def process_job(job: dict):
     file_name = job["file_name"]
     storage_path = job["storage_path"]
     file_type = job["file_type"]
+    converted_pdf_path = job.get("converted_pdf_path")
     pages_count = job["pages_count"]
     copies = job.get("copies", 1) or 1
 
@@ -202,13 +223,25 @@ def process_job(job: dict):
 
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
-        local_path = workdir / file_name
-        download_job_file(storage_path, local_path)
 
-        print_target = local_path
-        if file_type in CONVERTIBLE_CATEGORIES:
-            print(f"[job {job_id}] converting {file_type} to PDF via LibreOffice...")
-            print_target = convert_to_pdf(local_path, workdir)
+        if file_type in CONVERTIBLE_CATEGORIES and converted_pdf_path:
+            # Reuse the exact PDF that was already produced and counted
+            # during the counting phase, instead of converting the source
+            # file again — guarantees what gets printed matches exactly
+            # what was counted and charged for.
+            print(f"[job {job_id}] reusing already-converted PDF from counting phase")
+            print_target = workdir / "converted.pdf"
+            download_job_file(converted_pdf_path, print_target)
+        else:
+            local_path = workdir / file_name
+            download_job_file(storage_path, local_path)
+            print_target = local_path
+            if file_type in CONVERTIBLE_CATEGORIES:
+                # Fallback path — only hit if a job somehow has no saved
+                # conversion (e.g. an older job created before this
+                # feature existed). Converts fresh, same as before.
+                print(f"[job {job_id}] no saved conversion found, converting {file_type} fresh...")
+                print_target = convert_to_pdf(local_path, workdir)
 
         print(f"[job {job_id}] sending to printer '{CUPS_PRINTER_NAME}'...")
         print_file(print_target, copies)
@@ -230,6 +263,15 @@ def process_job(job: dict):
 
     set_job_status(job_id, "COMPLETED")
     print(f"[job {job_id}] done. paper_remaining now {new_remaining}")
+
+    # The converted PDF was only ever a working artifact for counting +
+    # printing — clean it up now that the job is done, so Storage doesn't
+    # accumulate a permanent duplicate of every PPT/DOC ever printed.
+    if converted_pdf_path:
+        try:
+            supabase.storage.from_(STORAGE_BUCKET).remove([converted_pdf_path])
+        except Exception as e:
+            print(f"[job {job_id}] could not clean up converted PDF (non-fatal): {e}")
 
 
 def main_loop():

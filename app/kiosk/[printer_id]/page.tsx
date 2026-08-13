@@ -316,27 +316,33 @@ export default function KioskPage() {
     );
   };
 
+  // Shared cleanup: fetches converted_pdf_path (only known server-side,
+  // written by the Pi during counting) before deleting, so a removed PPT/
+  // DOC doesn't leave a converted PDF orphaned in Storage on top of the
+  // original upload.
+  const deleteJobAndFiles = async (jobId: string, storagePath?: string) => {
+    try {
+      const { data: row } = await supabase.from('print_jobs').select('converted_pdf_path').eq('id', jobId).single();
+      await supabase.from('print_jobs').delete().eq('id', jobId);
+      const pathsToRemove = [storagePath, row?.converted_pdf_path].filter(Boolean) as string[];
+      if (pathsToRemove.length > 0) {
+        await supabase.storage.from('print-files').remove(pathsToRemove);
+      }
+    } catch (err) {
+      console.error('Failed to clean up removed file:', err);
+    }
+  };
+
   const removeFile = async (id: string) => {
     const item = files.find((f) => f.id === id);
     setFiles((prev) => prev.filter((f) => f.id !== id));
 
     // PPT/DOC files that were already uploaded (jobId set) need their
-    // storage object and print_jobs row cleaned up — otherwise a "wrong
+    // storage object(s) and print_jobs row cleaned up — otherwise a "wrong
     // file, remove it" click would leave an orphaned upload sitting in
     // Storage and a dead COUNTING/PENDING row in the database forever.
     if (item?.jobId) {
-      try {
-        await supabase.from('print_jobs').delete().eq('id', item.jobId);
-      } catch (err) {
-        console.error('Failed to delete job row for removed file:', err);
-      }
-    }
-    if (item?.storagePath) {
-      try {
-        await supabase.storage.from('print-files').remove([item.storagePath]);
-      } catch (err) {
-        console.error('Failed to delete storage object for removed file:', err);
-      }
+      await deleteJobAndFiles(item.jobId, item.storagePath);
     }
   };
 
@@ -344,12 +350,7 @@ export default function KioskPage() {
     const toClean = files.filter((f) => f.jobId);
     setFiles([]);
     for (const item of toClean) {
-      try {
-        await supabase.from('print_jobs').delete().eq('id', item.jobId!);
-        if (item.storagePath) await supabase.storage.from('print-files').remove([item.storagePath]);
-      } catch (err) {
-        console.error('Failed to clean up abandoned file:', err);
-      }
+      await deleteJobAndFiles(item.jobId!, item.storagePath);
     }
   };
 
