@@ -13,6 +13,11 @@ declare global {
 const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
 const COST_PER_PAGE = 4; // ₹4 per page
 const LOW_PAPER_THRESHOLD = 10;
+// The Pi worker heartbeats every POLL_INTERVAL_SECONDS (5s by default). If
+// we haven't heard from it in this long, treat it as offline even if the
+// last values it wrote to the database were "online" — a Pi that's been
+// switched off doesn't get to update its own row to say so.
+const HEARTBEAT_STALE_MS = 20000;
 
 type Category = 'PDF' | 'IMAGE' | 'PPT' | 'DOC';
 
@@ -23,6 +28,7 @@ interface PrinterStatus {
   paper_remaining: number;
   pi_internet_online: boolean;
   pi_printer_connected: boolean;
+  last_heartbeat: string;
 }
 
 interface UploadedFile {
@@ -30,7 +36,16 @@ interface UploadedFile {
   file: File;
   category: Category;
   pageCount: number;
-  estimated: boolean; // true when page count is a heuristic, not exact
+  estimated: boolean; // true when the count is an editable fallback, not exact
+  pdfError?: string;
+  // Set once a PPT/DOC file has been uploaded and its print_jobs row
+  // created — used to route realtime updates to the right file, and to
+  // clean up storage/DB if the person removes the file before paying.
+  jobId?: string;
+  storagePath?: string;
+  counting?: boolean; // true while the Pi is still converting/counting
+  countingStartedAt?: number;
+  countFailed?: boolean;
 }
 
 interface QueueItem {
@@ -48,39 +63,40 @@ const CATEGORY_META: Record<Category, { label: string; icon: string; gradient: s
 };
 
 // ---- Page counting -------------------------------------------------------
-// PDFs: counted exactly via pdf.js.
-// Images: always 1 page.
-// PPT / DOC: no reliable exact count in-browser without a full renderer, so
-// we estimate from file size and flag it as an estimate in the UI. For
-// exact billing, confirm the real count server-side before charging (e.g. a
-// LibreOffice headless conversion step), or reconcile after printing.
+// PDFs & images: counted exactly, instantly, in the browser — no round
+// trip needed. PDFs use pdf.js with a self-hosted worker file
+// (public/pdf.worker.min.mjs) rather than an external CDN, since loading
+// the worker from cdnjs previously failed silently on networks that block
+// or throttle that domain (common on campus/hostel wifi), causing PDFs to
+// be undercounted as "1 page".
+//
+// PPT/DOC: a browser genuinely can't render these to get a real page
+// count, so these are uploaded immediately (before payment) and the
+// Raspberry Pi — which already has LibreOffice installed for printing —
+// converts them and writes back the exact page count. See handleFileChange
+// and the realtime subscription below for how this plays out; this section
+// only covers the instant PDF/image path.
 
 async function getPdfPageCount(file: File): Promise<number> {
   const pdfjsLib = await import('pdfjs-dist');
-  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   return pdf.numPages;
 }
 
-function estimatePages(file: File, category: Category): number {
-  if (category === 'PPT') return Math.max(1, Math.ceil(file.size / (700 * 1024))); // ~700KB/slide
-  if (category === 'DOC') return Math.max(1, Math.ceil(file.size / (60 * 1024))); // ~60KB/page
-  return 1;
-}
-
-async function resolvePageCount(file: File, category: Category): Promise<{ pageCount: number; estimated: boolean }> {
-  if (category === 'IMAGE') return { pageCount: 1, estimated: false };
-  if (category === 'PDF') {
-    try {
-      const pageCount = await getPdfPageCount(file);
-      return { pageCount, estimated: false };
-    } catch (err) {
-      console.error('PDF parse failed, falling back to estimate:', err);
-      return { pageCount: estimatePages(file, category), estimated: true };
-    }
+// Only used as a last-resort editable fallback for PDFs whose page count
+// genuinely failed to parse (corrupt file, etc) — not used for PPT/DOC at
+// all anymore, since those get an exact Pi-verified count instead of a
+// file-size guess.
+async function resolvePdfPageCount(file: File): Promise<{ pageCount: number; estimated: boolean; pdfError?: string }> {
+  try {
+    const pageCount = await getPdfPageCount(file);
+    return { pageCount, estimated: false };
+  } catch (err) {
+    console.error('PDF page count failed:', err);
+    return { pageCount: 1, estimated: true, pdfError: 'Could not read page count from this PDF — please re-check it before paying.' };
   }
-  return { pageCount: estimatePages(file, category), estimated: true };
 }
 
 // ---- Component ------------------------------------------------------------
@@ -108,6 +124,10 @@ export default function KioskPage() {
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
   const [pendingJobIds, setPendingJobIds] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Forces a re-render every few seconds purely so the heartbeat-staleness
+  // check below gets re-evaluated even when no new data has arrived from
+  // Supabase (e.g. the Pi went silent and nothing is pushing updates).
+  const [, forceTick] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -127,6 +147,11 @@ export default function KioskPage() {
     script.src = 'https://checkout.razorpay.com/v1/checkout.js';
     script.async = true;
     document.body.appendChild(script);
+  }, []);
+
+  useEffect(() => {
+    const tick = setInterval(() => forceTick((n) => n + 1), 5000);
+    return () => clearInterval(tick);
   }, []);
 
   const fetchQueue = useCallback(async () => {
@@ -176,7 +201,27 @@ export default function KioskPage() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'print_jobs', filter: `printer_id=eq.${printerId}` },
-        () => fetchQueue()
+        (payload) => {
+          fetchQueue();
+          // Route counting-job updates from the Pi back to the matching
+          // file in the upload list. Using the functional setState form
+          // avoids needing `files` as an effect dependency (which would
+          // otherwise mean re-subscribing the whole realtime channel every
+          // time the file list changes).
+          const updated = payload.new as { id: string; status: string; pages_count: number; amount_paid: number };
+          setFiles((prev) =>
+            prev.map((f) => {
+              if (f.jobId !== updated.id) return f;
+              if (updated.status === 'PENDING') {
+                return { ...f, pageCount: updated.pages_count, estimated: false, counting: false, countFailed: false };
+              }
+              if (updated.status === 'COUNT_FAILED') {
+                return { ...f, counting: false, countFailed: true, estimated: true };
+              }
+              return f; // still COUNTING or some other transient state
+            })
+          );
+        }
       )
       .subscribe();
 
@@ -205,25 +250,110 @@ export default function KioskPage() {
     }
 
     const category = selectedCategory;
-    const processed: UploadedFile[] = [];
-    for (const file of newFiles) {
-      const { pageCount, estimated } = await resolvePageCount(file, category);
-      processed.push({
-        id: Math.random().toString(36).slice(2),
-        file,
-        category,
-        pageCount,
-        estimated,
-      });
+
+    if (category === 'PDF' || category === 'IMAGE') {
+      // Instant, exact, no upload needed yet — same as before.
+      const processed: UploadedFile[] = [];
+      for (const file of newFiles) {
+        const id = Math.random().toString(36).slice(2);
+        if (category === 'IMAGE') {
+          processed.push({ id, file, category, pageCount: 1, estimated: false });
+        } else {
+          const { pageCount, estimated, pdfError } = await resolvePdfPageCount(file);
+          processed.push({ id, file, category, pageCount, estimated, pdfError });
+        }
+      }
+      setFiles((prev) => [...prev, ...processed]);
+      e.target.value = '';
+      return;
     }
 
-    setFiles((prev) => [...prev, ...processed]);
+    // PPT / DOC: upload immediately and create a COUNTING job so the Pi can
+    // convert it and write back the real page count. Files are added to
+    // the list right away showing a "counting..." state, then updated by
+    // the realtime subscription above once the Pi finishes.
+    for (const file of newFiles) {
+      const localId = Math.random().toString(36).slice(2);
+      setFiles((prev) => [
+        ...prev,
+        { id: localId, file, category, pageCount: 0, estimated: false, counting: true, countingStartedAt: Date.now() },
+      ]);
+
+      try {
+        const path = `${printerId}/${Date.now()}_${file.name}`;
+        const { error: uploadError } = await supabase.storage.from('print-files').upload(path, file, { upsert: false });
+        if (uploadError) throw uploadError;
+
+        const { data: jobRow, error: insertError } = await supabase
+          .from('print_jobs')
+          .insert({
+            printer_id: printerId,
+            file_type: category,
+            file_name: file.name,
+            storage_path: path,
+            pages_count: 0,
+            amount_paid: 0,
+            status: 'COUNTING',
+          })
+          .select('id')
+          .single();
+        if (insertError) throw insertError;
+
+        setFiles((prev) => prev.map((f) => (f.id === localId ? { ...f, jobId: jobRow.id, storagePath: path } : f)));
+      } catch (err) {
+        console.error('Failed to upload/queue file for counting:', err);
+        setFiles((prev) => prev.filter((f) => f.id !== localId));
+        setErrorMsg(`Couldn't upload ${file.name} — please try again.`);
+      }
+    }
+
     e.target.value = '';
   };
 
-  const removeFile = (id: string) => {
-    setFiles((prev) => prev.filter((f) => f.id !== id));
+  const updatePageCount = (id: string, newCount: number) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, pageCount: Math.max(1, Math.round(newCount) || 1) } : f))
+    );
   };
+
+  const removeFile = async (id: string) => {
+    const item = files.find((f) => f.id === id);
+    setFiles((prev) => prev.filter((f) => f.id !== id));
+
+    // PPT/DOC files that were already uploaded (jobId set) need their
+    // storage object and print_jobs row cleaned up — otherwise a "wrong
+    // file, remove it" click would leave an orphaned upload sitting in
+    // Storage and a dead COUNTING/PENDING row in the database forever.
+    if (item?.jobId) {
+      try {
+        await supabase.from('print_jobs').delete().eq('id', item.jobId);
+      } catch (err) {
+        console.error('Failed to delete job row for removed file:', err);
+      }
+    }
+    if (item?.storagePath) {
+      try {
+        await supabase.storage.from('print-files').remove([item.storagePath]);
+      } catch (err) {
+        console.error('Failed to delete storage object for removed file:', err);
+      }
+    }
+  };
+
+  const clearAllFiles = async () => {
+    const toClean = files.filter((f) => f.jobId);
+    setFiles([]);
+    for (const item of toClean) {
+      try {
+        await supabase.from('print_jobs').delete().eq('id', item.jobId!);
+        if (item.storagePath) await supabase.storage.from('print-files').remove([item.storagePath]);
+      } catch (err) {
+        console.error('Failed to clean up abandoned file:', err);
+      }
+    }
+  };
+
+  const anyFileStillCounting = files.some((f) => f.counting);
 
   const getTotalPages = () => files.reduce((acc, f) => acc + f.pageCount, 0);
   const getTotalCost = () => getTotalPages() * COST_PER_PAGE;
@@ -236,6 +366,23 @@ export default function KioskPage() {
       const jobIds: string[] = [];
 
       for (const item of files) {
+        if (item.jobId) {
+          // PPT/DOC already uploaded + counted (or manually corrected after
+          // a COUNT_FAILED). Sync whatever page count is currently shown —
+          // covers the case where the person edited a failed-count fallback
+          // — so the database (which the payment amount is computed from)
+          // matches exactly what they're about to see on the payment screen.
+          const amount = item.pageCount * COST_PER_PAGE;
+          const { error: updateError } = await supabase
+            .from('print_jobs')
+            .update({ pages_count: item.pageCount, amount_paid: amount, status: 'PENDING' })
+            .eq('id', item.jobId);
+          if (updateError) throw updateError;
+          jobIds.push(item.jobId);
+          continue;
+        }
+
+        // PDF / IMAGE: not uploaded yet, do it now.
         const path = `${printerId}/${Date.now()}_${item.file.name}`;
 
         const { error: uploadError } = await supabase.storage
@@ -281,9 +428,12 @@ export default function KioskPage() {
       const res = await fetch('/api/create-razorpay-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount: getTotalCost(), job_ids: pendingJobIds }),
+        body: JSON.stringify({ job_ids: pendingJobIds }),
       });
-      if (!res.ok) throw new Error('Order creation failed');
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Order creation failed');
+      }
       const orderData = await res.json();
 
       const options = {
@@ -374,10 +524,20 @@ export default function KioskPage() {
   // While we don't yet know the printer's status, don't claim it's offline —
   // just show a neutral "checking" state and keep buttons disabled only
   // for that reason (with a spinner), not silently forever.
-  const printerOffline = !statusLoading && !statusError && !printerStatus?.pi_internet_online;
+  const heartbeatStale =
+    !printerStatus?.last_heartbeat ||
+    Date.now() - new Date(printerStatus.last_heartbeat).getTime() > HEARTBEAT_STALE_MS;
+  const printerOffline = !statusLoading && !statusError && (heartbeatStale || !printerStatus?.pi_internet_online);
+  // Separate from internet connectivity — the Pi itself can be online while
+  // the printer's USB cable has been unplugged (accidentally, or someone
+  // swapping in their own device). Previously this flag was fetched but
+  // never actually checked anywhere in the UI.
+  const printerDisconnected =
+    !statusLoading && !statusError && !heartbeatStale && !!printerStatus && !printerStatus.pi_printer_connected;
   const lowPaper = !!printerStatus && printerStatus.paper_remaining < LOW_PAPER_THRESHOLD;
   const printerDisabled = !!printerStatus && !printerStatus.is_enabled;
-  const canUpload = !statusLoading && !statusError && !printerOffline && !lowPaper && !printerDisabled;
+  const canUpload =
+    !statusLoading && !statusError && !printerOffline && !printerDisconnected && !lowPaper && !printerDisabled;
 
   // 2. MAIN DASHBOARD
   return (
@@ -399,6 +559,10 @@ export default function KioskPage() {
           ) : printerOffline ? (
             <span className="status-pill status-pill-red">
               <i className="bi bi-wifi-off me-1"></i> No internet connectivity of printer, please wait to establish the internet
+            </span>
+          ) : printerDisconnected ? (
+            <span className="status-pill status-pill-red">
+              <i className="bi bi-usb-plug-fill me-1"></i> Printer not connected, please wait
             </span>
           ) : printerDisabled ? (
             <span className="status-pill status-pill-neutral">
@@ -461,39 +625,81 @@ export default function KioskPage() {
             {selectedCategory && (
               <div className="card kiosk-card">
                 <div className="card-header d-flex justify-content-between align-items-center border-secondary">
+                  <button
+                    onClick={() => {
+                      setSelectedCategory(null);
+                      clearAllFiles();
+                    }}
+                    className="btn btn-link text-secondary text-decoration-none p-0 d-flex align-items-center gap-1"
+                  >
+                    <i className="bi bi-arrow-left"></i>
+                    <span className="small">Back</span>
+                  </button>
                   <div className="d-flex align-items-center gap-2">
                     <i className={`bi ${CATEGORY_META[selectedCategory].icon} text-info`}></i>
                     <h6 className="mb-0 fw-bold">
                       {files.length > 0 ? `Selected Files (${files.length})` : `Add your ${CATEGORY_META[selectedCategory].label} files`}
                     </h6>
                   </div>
-                  <button
-                    onClick={() => {
-                      setSelectedCategory(null);
-                      setFiles([]);
-                    }}
-                    className="btn btn-sm btn-outline-secondary border-0"
-                  >
-                    <i className="bi bi-arrow-repeat me-1"></i> Change type
-                  </button>
                 </div>
 
                 {files.length > 0 && (
-                  <div className="card-body p-2" style={{ maxHeight: '220px', overflowY: 'auto' }}>
+                  <div className="card-body p-2" style={{ maxHeight: '260px', overflowY: 'auto' }}>
                     {files.map((item) => (
-                      <div key={item.id} className="d-flex justify-content-between align-items-center file-row p-2 rounded mb-2">
-                        <div className="d-flex align-items-center gap-2 text-truncate me-2">
-                          <span className="badge bg-info text-dark">{item.category}</span>
-                          <span className="small text-truncate">{item.file.name}</span>
+                      <div key={item.id} className="file-row p-2 rounded mb-2">
+                        <div className="d-flex justify-content-between align-items-center">
+                          <div className="d-flex align-items-center gap-2 text-truncate me-2">
+                            <span className="badge bg-info text-dark">{item.category}</span>
+                            <span className="small text-truncate">{item.file.name}</span>
+                          </div>
+                          <div className="d-flex align-items-center gap-2">
+                            {item.counting ? (
+                              <span className="small text-info d-flex align-items-center gap-1">
+                                <span className="spinner-border spinner-border-sm" role="status" />
+                                Counting pages...
+                              </span>
+                            ) : item.estimated ? (
+                              <div className="d-flex align-items-center gap-1">
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={item.pageCount}
+                                  onChange={(e) => updatePageCount(item.id, Number(e.target.value))}
+                                  className="form-control form-control-sm bg-dark text-light border-secondary"
+                                  style={{ width: '60px' }}
+                                />
+                                <span className="small text-secondary">pg (est.)</span>
+                              </div>
+                            ) : (
+                              <span className="small text-secondary">{item.pageCount} pg</span>
+                            )}
+                            <button
+                              onClick={() => removeFile(item.id)}
+                              disabled={item.counting}
+                              className="btn btn-sm btn-outline-danger border-0"
+                            >
+                              <i className="bi bi-trash-fill"></i>
+                            </button>
+                          </div>
                         </div>
-                        <div className="d-flex align-items-center gap-3">
-                          <span className="small text-secondary">
-                            {item.pageCount} pg{item.estimated ? ' (est.)' : ''}
-                          </span>
-                          <button onClick={() => removeFile(item.id)} className="btn btn-sm btn-outline-danger border-0">
-                            <i className="bi bi-trash-fill"></i>
-                          </button>
-                        </div>
+                        {item.countFailed && (
+                          <p className="small text-warning mb-0 mt-1">
+                            <i className="bi bi-info-circle me-1"></i>
+                            The printer couldn't read this file to count its pages — please check and correct the number above before paying.
+                          </p>
+                        )}
+                        {!item.countFailed && item.estimated && (
+                          <p className="small text-warning mb-0 mt-1">
+                            <i className="bi bi-info-circle me-1"></i>
+                            {item.pdfError || "We couldn't read the exact page count for this file — please check and correct the number above before paying."}
+                          </p>
+                        )}
+                        {item.counting && item.countingStartedAt && Date.now() - item.countingStartedAt > 45000 && (
+                          <p className="small text-warning mb-0 mt-1">
+                            <i className="bi bi-hourglass-split me-1"></i>
+                            Taking longer than usual — the printer may be busy or briefly offline. Still waiting...
+                          </p>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -510,13 +716,18 @@ export default function KioskPage() {
                       <div className="text-end small text-secondary">Size: {getTotalSizeMB()} / 350 MB</div>
                       <button
                         onClick={handleProceedToCheckout}
-                        disabled={!canUpload || isUploading}
+                        disabled={!canUpload || isUploading || anyFileStillCounting}
                         className="btn btn-print fw-bold w-100 py-2"
                       >
                         {isUploading ? (
                           <>
                             <span className="spinner-border spinner-border-sm me-2" role="status" />
                             Uploading files...
+                          </>
+                        ) : anyFileStillCounting ? (
+                          <>
+                            <span className="spinner-border spinner-border-sm me-2" role="status" />
+                            Counting pages...
                           </>
                         ) : (
                           <>
