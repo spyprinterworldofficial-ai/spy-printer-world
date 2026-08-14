@@ -11,7 +11,7 @@ declare global {
 }
 
 const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
-const COST_PER_PAGE = 4; // ₹4 per page
+const COST_PER_PAGE = 5; // ₹4 per page
 const LOW_PAPER_THRESHOLD = 10;
 // The Pi worker heartbeats every POLL_INTERVAL_SECONDS (5s by default). If
 // we haven't heard from it in this long, treat it as offline even if the
