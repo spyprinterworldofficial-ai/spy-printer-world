@@ -36,7 +36,13 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `Job ${notReady.id} is not ready for payment (status: ${notReady.status})` }, { status: 400 });
     }
 
-    const COST_PER_PAGE = 4; // must match the Pi worker's COST_PER_PAGE and the website's display constant
+    // Server-side, not NEXT_PUBLIC — this route doesn't need it baked into
+    // the browser bundle. Must be kept in sync with NEXT_PUBLIC_COST_PER_PAGE
+    // (frontend display) and COST_PER_PAGE in the Pi worker's .env — three
+    // separate places since each runs in a different environment, but all
+    // three now read from an actual env var instead of a hardcoded number,
+    // so a config change can't silently fail to apply like it did before.
+    const COST_PER_PAGE = Number(process.env.COST_PER_PAGE) || 4;
     const totalPages = jobs.reduce((sum, j) => sum + j.pages_count * (j.copies || 1), 0);
     const amountRupees = totalPages * COST_PER_PAGE;
 

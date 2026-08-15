@@ -11,7 +11,16 @@ declare global {
 }
 
 const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
-const COST_PER_PAGE = 5; // ₹4 per page
+// Reads from NEXT_PUBLIC_COST_PER_PAGE (set in Vercel), falling back to 4
+// only if that env var is somehow missing. Must be kept in sync with
+// COST_PER_PAGE in create-razorpay-order/route.ts (server-side) and the Pi
+// worker's .env — three separate places since each runs in a different
+// environment. This value only drives what's *displayed* and what the
+// initial insert for PDF/Image jobs uses; the actual charge is always
+// recomputed server-side from the database at payment time, so even if
+// this one drifted, someone couldn't pay less than the real total — but
+// keeping them in sync avoids showing the wrong price on screen.
+const COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_COST_PER_PAGE) || 4;
 const LOW_PAPER_THRESHOLD = 10;
 // The Pi worker heartbeats every POLL_INTERVAL_SECONDS (5s by default). If
 // we haven't heard from it in this long, treat it as offline even if the
