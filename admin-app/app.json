@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "S.py Admin",
+    "slug": "spy-admin-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/spy-logo.png",
+    "scheme": "adminapp",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "icon": "./assets/images/spy-logo.png"
+    },
+    "android": {
+      "package": "com.spyprinterworld.admin",
+      "permissions": [
+        "NOTIFICATIONS"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#0a0e12",
+        "foregroundImage": "./assets/images/spy-logo.png",
+        "backgroundImage": "./assets/images/spy-logo.png",
+        "monochromeImage": "./assets/images/spy-logo.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "output": "static",
+      "favicon": "./assets/images/spy-logo.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0a0e12",
+          "image": "./assets/images/spy-logo.png",
+          "imageWidth": 76
+        }
+      ], [
+      "expo-notifications"
+    ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
