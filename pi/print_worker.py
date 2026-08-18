@@ -69,17 +69,23 @@ def check_printer_connected() -> bool:
 def send_heartbeat():
     online = check_internet()
     printer_ok = check_printer_connected() if online else False
+    # Tracked separately from `online` (a generic Google ping) because the
+    # two can genuinely disagree — e.g. general internet works fine while
+    # Supabase specifically is unreachable (stale DNS entry, routing quirk,
+    # etc). What actually matters for the whole system is whether we can
+    # reach Supabase, so self-healing below is gated on this, not on the
+    # generic ping.
+    heartbeat_write_ok = False
     try:
         supabase.table("printers").update({
             "pi_internet_online": online,
             "pi_printer_connected": printer_ok,
             "last_heartbeat": "now()",
         }).eq("id", PRINTER_ID).execute()
+        heartbeat_write_ok = True
     except Exception as e:
-        # If this fails, we likely have no internet anyway — just log and
-        # keep the worker alive for next cycle.
         print(f"[heartbeat] failed to update: {e}")
-    return online, printer_ok
+    return online, printer_ok, heartbeat_write_ok
 
 
 def fetch_next_job():
@@ -378,10 +384,15 @@ def main_loop():
 
     while True:
         try:
-            online, printer_ok = send_heartbeat()
-            if not online:
+            online, printer_ok, heartbeat_write_ok = send_heartbeat()
+            if not heartbeat_write_ok:
+                # Gated on whether we could actually reach Supabase, not on
+                # the generic `online` ping — those two can genuinely
+                # disagree (general internet fine, Supabase specifically
+                # unreachable due to a stale DNS entry or similar), and
+                # what actually matters here is Supabase reachability.
                 consecutive_offline_cycles += 1
-                print(f"[loop] no internet — skipping this cycle (offline for {consecutive_offline_cycles} cycles)")
+                print(f"[loop] can't reach Supabase — skipping this cycle (failing for {consecutive_offline_cycles} cycles, general internet check: {online})")
                 if consecutive_offline_cycles % RECONNECT_EVERY_N_CYCLES == 0:
                     try_reconnect_wifi()
             else:
