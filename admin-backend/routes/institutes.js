@@ -37,7 +37,7 @@ router.get('/states', async (_req, res) => {
 router.get('/:id/printers', async (req, res) => {
   const { data, error } = await supabase
     .from('printers')
-    .select('id, name, is_enabled, paper_remaining, pi_internet_online, pi_printer_connected')
+    .select('id, name, is_enabled, paper_remaining, pi_internet_online, pi_printer_connected, last_heartbeat')
     .eq('institute_id', req.params.id)
     .order('name', { ascending: true });
 

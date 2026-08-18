@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
 import { api } from '../api/client';
+import { isInternetOnline, isPrinterConnected } from '../utils/printerStatus';
 
 export default function PrinterListScreen({ route, navigation }) {
   const { instituteId, instituteName } = route.params;
@@ -9,7 +10,12 @@ export default function PrinterListScreen({ route, navigation }) {
 
   useEffect(() => {
     navigation.setOptions({ title: instituteName });
-    api.getPrinters(instituteId).then(setPrinters).catch(console.error).finally(() => setLoading(false));
+    const load = () => api.getPrinters(instituteId).then(setPrinters).catch(console.error).finally(() => setLoading(false));
+    load();
+    // Poll periodically so an offline dot actually goes red while you're
+    // looking at the screen, rather than only updating on next navigation.
+    const interval = setInterval(load, 15000);
+    return () => clearInterval(interval);
   }, [instituteId]);
 
   if (loading) return <ActivityIndicator color="#36d1dc" style={{ flex: 1, backgroundColor: '#0a0e12' }} />;
@@ -28,7 +34,7 @@ export default function PrinterListScreen({ route, navigation }) {
               <Text style={styles.rowTitle}>{item.name}</Text>
               <Text style={styles.rowSubtitle}>{item.paper_remaining} pages left</Text>
             </View>
-            <View style={[styles.dot, { backgroundColor: item.pi_internet_online && item.pi_printer_connected ? '#4ade80' : '#f87171' }]} />
+            <View style={[styles.dot, { backgroundColor: isInternetOnline(item) && isPrinterConnected(item) ? '#4ade80' : '#f87171' }]} />
           </TouchableOpacity>
         )}
         ListEmptyComponent={<Text style={styles.empty}>No printers registered for this institute.</Text>}

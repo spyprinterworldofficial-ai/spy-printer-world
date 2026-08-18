@@ -24,7 +24,7 @@ export async function POST(req: Request) {
     // haven't settled on a real page count yet).
     const { data: jobs, error: fetchError } = await supabaseAdmin
       .from('print_jobs')
-      .select('id, pages_count, copies, status')
+      .select('id, pages_count, copies, status, file_type')
       .in('id', job_ids);
     if (fetchError) throw fetchError;
 
@@ -38,13 +38,18 @@ export async function POST(req: Request) {
 
     // Server-side, not NEXT_PUBLIC — this route doesn't need it baked into
     // the browser bundle. Must be kept in sync with NEXT_PUBLIC_COST_PER_PAGE
-    // (frontend display) and COST_PER_PAGE in the Pi worker's .env — three
-    // separate places since each runs in a different environment, but all
-    // three now read from an actual env var instead of a hardcoded number,
-    // so a config change can't silently fail to apply like it did before.
+    // / NEXT_PUBLIC_BLANK_COST_PER_PAGE (frontend display) and the matching
+    // vars in the Pi worker's .env — several separate places since each
+    // runs in a different environment, but all read from an actual env var
+    // instead of a hardcoded number, so a config change can't silently
+    // fail to apply like it did before.
     const COST_PER_PAGE = Number(process.env.COST_PER_PAGE) || 4;
-    const totalPages = jobs.reduce((sum, j) => sum + j.pages_count * (j.copies || 1), 0);
-    const amountRupees = totalPages * COST_PER_PAGE;
+    const BLANK_COST_PER_PAGE = Number(process.env.BLANK_COST_PER_PAGE) || 1.5;
+
+    const amountRupees = jobs.reduce((sum, j) => {
+      const rate = j.file_type === 'BLANK' ? BLANK_COST_PER_PAGE : COST_PER_PAGE;
+      return sum + j.pages_count * (j.copies || 1) * rate;
+    }, 0);
 
     if (amountRupees <= 0) {
       return NextResponse.json({ error: 'Computed amount is zero' }, { status: 400 });

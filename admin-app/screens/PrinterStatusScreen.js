@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { View, Text, Switch, TouchableOpacity, StyleSheet, ActivityIndicator, TextInput, Alert, ScrollView } from 'react-native';
 import { api } from '../api/client';
+import { isInternetOnline, isPrinterConnected } from '../utils/printerStatus';
 
 export default function PrinterStatusScreen({ route, navigation }) {
   const { printerId, printerName } = route.params;
@@ -136,14 +137,14 @@ export default function PrinterStatusScreen({ route, navigation }) {
       <View style={styles.card}>
         <View style={styles.rowBetween}>
           <Text style={styles.label}>Pi internet connection</Text>
-          <View style={[styles.dot, { backgroundColor: printer.pi_internet_online ? '#4ade80' : '#f87171' }]} />
+          <View style={[styles.dot, { backgroundColor: isInternetOnline(printer) ? '#4ade80' : '#f87171' }]} />
         </View>
       </View>
 
       <View style={styles.card}>
         <View style={styles.rowBetween}>
           <Text style={styles.label}>Pi ↔ printer connection</Text>
-          <View style={[styles.dot, { backgroundColor: printer.pi_printer_connected ? '#4ade80' : '#f87171' }]} />
+          <View style={[styles.dot, { backgroundColor: isPrinterConnected(printer) ? '#4ade80' : '#f87171' }]} />
         </View>
         <Text style={styles.hint}>
           Turns red if the Pi can't reach the printer — including if someone unplugs it and connects their own device instead.

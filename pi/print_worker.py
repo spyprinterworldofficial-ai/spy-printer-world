@@ -28,6 +28,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 
 load_dotenv()
 
@@ -42,7 +44,6 @@ COST_PER_PAGE = int(os.environ.get("COST_PER_PAGE", "4"))
 
 STORAGE_BUCKET = "print-files"
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
@@ -152,11 +153,67 @@ def get_pdf_page_count(pdf_path: Path) -> int:
     raise RuntimeError("Could not find a 'Pages:' line in pdfinfo output")
 
 
+def extract_page_range(source_pdf: Path, page_range: str, workdir: Path) -> Path:
+    """Extracts only the specified pages into a new PDF using qpdf.
+    page_range is always a fully-expanded, deduped, sorted comma list
+    (e.g. "1,3,5,6,7,8,9,12") written by the frontend — never shorthand
+    like "5-9" — so there's no ambiguity between the page count someone
+    was billed for and what actually gets extracted here. Requires
+    `sudo apt install qpdf`."""
+    output_path = workdir / "page_range_extract.pdf"
+    subprocess.run(
+        ["qpdf", str(source_pdf), "--pages", str(source_pdf), page_range, "--", str(output_path)],
+        check=True, timeout=60,
+    )
+    if not output_path.exists():
+        raise RuntimeError("qpdf did not produce the extracted page range PDF")
+    return output_path
+
+
+def generate_blank_pdf(num_pages: int, output_path: Path):
+    """Blank-page orders never had a real file to begin with — this
+    generates the PDF fresh at print time instead of downloading or
+    converting anything. A4 to match everything else this printer
+    produces."""
+    c = canvas.Canvas(str(output_path), pagesize=A4)
+    for _ in range(num_pages):
+        c.showPage()
+    c.save()
+
+
 def print_file(pdf_or_image_path: Path, copies: int):
     subprocess.run(
         ["lp", "-d", CUPS_PRINTER_NAME, "-n", str(max(1, copies)), str(pdf_or_image_path)],
         check=True, timeout=60,
     )
+
+
+def wait_until_printer_idle(timeout_seconds: int = 120):
+    """`lp` returns as soon as CUPS *accepts* a job into the queue — not
+    once the printer has actually finished physically printing it. With a
+    single file that timing gap never matters, but back-to-back files
+    (e.g. a multi-file order) can have the next job submitted to CUPS
+    while the printer is still mid-way through the previous one, and some
+    driver/printer combinations silently drop or mishandle a job that
+    arrives while they're still busy — CUPS still reports success, so
+    nothing looks wrong in our logs even though nothing came out.
+    Waiting here until CUPS reports the printer idle again, before we
+    consider the job truly done and move on to the next one, closes that
+    gap."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            result = subprocess.run(
+                ["lpstat", "-p", CUPS_PRINTER_NAME],
+                capture_output=True, text=True, timeout=10,
+            )
+            if "is idle" in result.stdout:
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    print(f"[print] Warning: printer did not report idle within {timeout_seconds}s — proceeding anyway.")
+    return False
 
 
 def upload_converted_pdf(pdf_path: Path, original_storage_path: str) -> str:
@@ -215,16 +272,22 @@ def process_job(job: dict):
     storage_path = job["storage_path"]
     file_type = job["file_type"]
     converted_pdf_path = job.get("converted_pdf_path")
+    page_range = job.get("page_range")
     pages_count = job["pages_count"]
     copies = job.get("copies", 1) or 1
 
-    print(f"[job {job_id}] picked up: {file_name} ({file_type}, {pages_count}p x{copies})")
+    print(f"[job {job_id}] picked up: {file_name} ({file_type}, {pages_count}p x{copies}"
+          f"{', pages ' + page_range if page_range else ''})")
     set_job_status(job_id, "PRINTING")
 
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
 
-        if file_type in CONVERTIBLE_CATEGORIES and converted_pdf_path:
+        if file_type == 'BLANK':
+            print(f"[job {job_id}] generating {pages_count} blank page(s)")
+            print_target = workdir / "blank.pdf"
+            generate_blank_pdf(pages_count, print_target)
+        elif file_type in CONVERTIBLE_CATEGORIES and converted_pdf_path:
             # Reuse the exact PDF that was already produced and counted
             # during the counting phase, instead of converting the source
             # file again — guarantees what gets printed matches exactly
@@ -243,8 +306,19 @@ def process_job(job: dict):
                 print(f"[job {job_id}] no saved conversion found, converting {file_type} fresh...")
                 print_target = convert_to_pdf(local_path, workdir)
 
+        # Applied last, after whichever PDF we're going to print has been
+        # resolved above (original, converted, or reused-converted) — this
+        # is what makes sure only the paid-for pages ever reach the
+        # printer, regardless of file type or conversion path.
+        if page_range and file_type not in ('IMAGE', 'BLANK'):
+            print(f"[job {job_id}] extracting pages {page_range} before printing")
+            print_target = extract_page_range(print_target, page_range, workdir)
+
         print(f"[job {job_id}] sending to printer '{CUPS_PRINTER_NAME}'...")
         print_file(print_target, copies)
+
+    print(f"[job {job_id}] waiting for printer to finish before considering this job done...")
+    wait_until_printer_idle()
 
     # Deduct paper. Never go negative — floor at 0 so the low-paper warning
     # on the kiosk still shows correctly rather than a nonsensical value.
@@ -274,14 +348,44 @@ def process_job(job: dict):
             print(f"[job {job_id}] could not clean up converted PDF (non-fatal): {e}")
 
 
+def try_reconnect_wifi():
+    """Runs `nmcli device connect wlan0` to nudge wifi back to life.
+    Requires passwordless sudo for this specific command to be configured
+    for this user (already the case here, since other `sudo` commands in
+    this setup guide run non-interactively). Used as a self-healing
+    fallback for a known Pi quirk where wifi sometimes doesn't
+    auto-connect cleanly after a fresh power cycle — a manual
+    `nmcli device connect wlan0` reliably fixes it when this happens, so
+    the worker does that automatically instead of needing someone to SSH
+    in and run it by hand."""
+    try:
+        result = subprocess.run(
+            ["sudo", "nmcli", "device", "connect", "wlan0"],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(f"[wifi-heal] reconnect attempt: {result.stdout.strip() or result.stderr.strip()}")
+    except Exception as e:
+        print(f"[wifi-heal] reconnect attempt failed: {e}")
+
+
 def main_loop():
     print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}'")
+    consecutive_offline_cycles = 0
+    # Only nudge wifi every ~60s of continuous offline-ness (12 cycles at
+    # the default 5s poll interval), not every single cycle — avoids
+    # hammering nmcli uselessly while giving it real chances to recover.
+    RECONNECT_EVERY_N_CYCLES = max(1, round(60 / POLL_INTERVAL_SECONDS))
+
     while True:
         try:
             online, printer_ok = send_heartbeat()
             if not online:
-                print("[loop] no internet — skipping this cycle")
+                consecutive_offline_cycles += 1
+                print(f"[loop] no internet — skipping this cycle (offline for {consecutive_offline_cycles} cycles)")
+                if consecutive_offline_cycles % RECONNECT_EVERY_N_CYCLES == 0:
+                    try_reconnect_wifi()
             else:
+                consecutive_offline_cycles = 0
                 # Page counting only needs internet + LibreOffice, not the
                 # physical printer — it still runs even if someone's
                 # unplugged the USB cable, unlike actual printing below.

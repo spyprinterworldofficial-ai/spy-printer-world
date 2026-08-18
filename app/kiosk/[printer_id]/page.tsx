@@ -21,6 +21,7 @@ const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
 // this one drifted, someone couldn't pay less than the real total — but
 // keeping them in sync avoids showing the wrong price on screen.
 const COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_COST_PER_PAGE) || 4;
+const BLANK_COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_BLANK_COST_PER_PAGE) || 1.5;
 const LOW_PAPER_THRESHOLD = 10;
 // The Pi worker heartbeats every POLL_INTERVAL_SECONDS (5s by default). If
 // we haven't heard from it in this long, treat it as offline even if the
@@ -28,7 +29,7 @@ const LOW_PAPER_THRESHOLD = 10;
 // switched off doesn't get to update its own row to say so.
 const HEARTBEAT_STALE_MS = 20000;
 
-type Category = 'PDF' | 'IMAGE' | 'PPT' | 'DOC';
+type Category = 'PDF' | 'IMAGE' | 'PPT' | 'DOC' | 'BLANK';
 
 interface PrinterStatus {
   id: string;
@@ -42,11 +43,14 @@ interface PrinterStatus {
 
 interface UploadedFile {
   id: string;
-  file: File;
+  file: File | null; // null for blank-page entries, which have no underlying file at all
   category: Category;
-  pageCount: number;
+  pageCount: number; // BILLED count — equals totalPages unless a page range is selected
+  totalPages: number; // the real full-document page count, used to validate ranges against
   estimated: boolean; // true when the count is an editable fallback, not exact
   pdfError?: string;
+  pageRange?: string; // fully-expanded, deduped, sorted comma list e.g. "1,3,5,6" — undefined means "print everything"
+  pageRangeError?: string;
   // Set once a PPT/DOC file has been uploaded and its print_jobs row
   // created — used to route realtime updates to the right file, and to
   // clean up storage/DB if the person removes the file before paying.
@@ -55,6 +59,43 @@ interface UploadedFile {
   counting?: boolean; // true while the Pi is still converting/counting
   countingStartedAt?: number;
   countFailed?: boolean;
+}
+
+// Parses a page-range string like "1-5, 8, 12-15" against a known total
+// page count. Returns a sorted, deduped array of individual page numbers
+// (never range shorthand) — this expanded form is what gets stored and
+// sent to the Pi, so there's zero ambiguity between what's billed and
+// what gets physically extracted and printed later.
+function parsePageRange(input: string, totalPages: number): { pages: number[]; error?: string } {
+  const trimmed = input.trim();
+  if (!trimmed) return { pages: [] }; // empty = print everything, handled by caller
+
+  const selected = new Set<number>();
+  const tokens = trimmed.split(',').map((t) => t.trim()).filter(Boolean);
+  if (tokens.length === 0) return { pages: [] };
+
+  for (const token of tokens) {
+    const rangeMatch = token.match(/^(\d+)\s*-\s*(\d+)$/);
+    const singleMatch = token.match(/^(\d+)$/);
+    if (rangeMatch) {
+      const start = parseInt(rangeMatch[1], 10);
+      const end = parseInt(rangeMatch[2], 10);
+      if (start < 1 || end > totalPages || start > end) {
+        return { pages: [], error: `"${token}" is not a valid range for this ${totalPages}-page document.` };
+      }
+      for (let p = start; p <= end; p++) selected.add(p);
+    } else if (singleMatch) {
+      const page = parseInt(singleMatch[1], 10);
+      if (page < 1 || page > totalPages) {
+        return { pages: [], error: `Page ${page} doesn't exist — this document has ${totalPages} pages.` };
+      }
+      selected.add(page);
+    } else {
+      return { pages: [], error: `"${token}" isn't a valid page or range (try something like "1-5, 8, 12-15").` };
+    }
+  }
+
+  return { pages: Array.from(selected).sort((a, b) => a - b) };
 }
 
 interface QueueItem {
@@ -69,6 +110,7 @@ const CATEGORY_META: Record<Category, { label: string; icon: string; gradient: s
   IMAGE: { label: 'Image', icon: 'bi-file-earmark-image-fill', gradient: 'linear-gradient(135deg,#36d1dc,#5b86e5)', accept: 'image/*' },
   PPT: { label: 'PPT', icon: 'bi-file-earmark-slides-fill', gradient: 'linear-gradient(135deg,#f7971e,#ffd200)', accept: '.ppt,.pptx' },
   DOC: { label: 'Doc', icon: 'bi-file-earmark-word-fill', gradient: 'linear-gradient(135deg,#00c6ff,#0072ff)', accept: '.doc,.docx' },
+  BLANK: { label: 'Blank Pages', icon: 'bi-file-earmark', gradient: 'linear-gradient(135deg,#8e9eab,#4b6076)', accept: '' },
 };
 
 // ---- Page counting -------------------------------------------------------
@@ -106,6 +148,48 @@ async function resolvePdfPageCount(file: File): Promise<{ pageCount: number; est
     console.error('PDF page count failed:', err);
     return { pageCount: 1, estimated: true, pdfError: 'Could not read page count from this PDF — please re-check it before paying.' };
   }
+}
+
+// Small self-contained control for the Blank Pages flow — a quantity
+// stepper with a live price preview, separate from the file-upload UI
+// since there's no file involved at all here.
+function BlankPagesPicker({ onAdd, unitPrice }: { onAdd: (qty: number) => void; unitPrice: number }) {
+  const [qty, setQty] = useState(1);
+  return (
+    <div className="d-flex flex-column gap-3 align-items-center py-3">
+      <p className="text-secondary small mb-0">How many blank sheets do you need?</p>
+      <div className="d-flex align-items-center gap-3">
+        <button
+          onClick={() => setQty((q) => Math.max(1, q - 1))}
+          className="btn btn-outline-secondary rounded-circle"
+          style={{ width: '44px', height: '44px' }}
+        >
+          <i className="bi bi-dash-lg"></i>
+        </button>
+        <input
+          type="number"
+          min={1}
+          value={qty}
+          onChange={(e) => setQty(Math.max(1, Math.round(Number(e.target.value)) || 1))}
+          className="form-control form-control-lg text-center bg-dark text-light border-secondary"
+          style={{ width: '90px' }}
+        />
+        <button
+          onClick={() => setQty((q) => q + 1)}
+          className="btn btn-outline-secondary rounded-circle"
+          style={{ width: '44px', height: '44px' }}
+        >
+          <i className="bi bi-plus-lg"></i>
+        </button>
+      </div>
+      <p className="small text-secondary mb-0">
+        ₹{unitPrice.toFixed(2)} / sheet — total ₹{(qty * unitPrice).toFixed(2)}
+      </p>
+      <button onClick={() => onAdd(qty)} className="btn btn-print fw-bold px-4 py-2">
+        <i className="bi bi-plus-lg me-2"></i> Add to order
+      </button>
+    </div>
+  );
 }
 
 // ---- Component ------------------------------------------------------------
@@ -222,10 +306,10 @@ export default function KioskPage() {
             prev.map((f) => {
               if (f.jobId !== updated.id) return f;
               if (updated.status === 'PENDING') {
-                return { ...f, pageCount: updated.pages_count, estimated: false, counting: false, countFailed: false };
+                return { ...f, pageCount: updated.pages_count, totalPages: updated.pages_count, estimated: false, counting: false, countFailed: false };
               }
               if (updated.status === 'COUNT_FAILED') {
-                return { ...f, counting: false, countFailed: true, estimated: true };
+                return { ...f, pageCount: f.pageCount || 1, totalPages: f.totalPages || 1, counting: false, countFailed: true, estimated: true };
               }
               return f; // still COUNTING or some other transient state
             })
@@ -241,7 +325,23 @@ export default function KioskPage() {
 
   const openPicker = (cat: Category) => {
     setSelectedCategory(cat);
+    if (cat === 'BLANK') return; // no file picker — quantity UI shown instead, see the card body
     setTimeout(() => fileInputRef.current?.click(), 0);
+  };
+
+  const addBlankPages = (quantity: number) => {
+    const qty = Math.max(1, Math.round(quantity) || 1);
+    setFiles((prev) => [
+      ...prev,
+      {
+        id: Math.random().toString(36).slice(2),
+        file: null,
+        category: 'BLANK',
+        pageCount: qty,
+        totalPages: qty,
+        estimated: false,
+      },
+    ]);
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -249,7 +349,7 @@ export default function KioskPage() {
     setErrorMsg(null);
 
     const newFiles = Array.from(e.target.files);
-    const currentTotalSize = files.reduce((acc, f) => acc + f.file.size, 0);
+    const currentTotalSize = files.reduce((acc, f) => acc + (f.file?.size || 0), 0);
     const newFilesTotalSize = newFiles.reduce((acc, f) => acc + f.size, 0);
 
     if (currentTotalSize + newFilesTotalSize > MAX_TOTAL_SIZE_BYTES) {
@@ -266,10 +366,10 @@ export default function KioskPage() {
       for (const file of newFiles) {
         const id = Math.random().toString(36).slice(2);
         if (category === 'IMAGE') {
-          processed.push({ id, file, category, pageCount: 1, estimated: false });
+          processed.push({ id, file, category, pageCount: 1, totalPages: 1, estimated: false });
         } else {
           const { pageCount, estimated, pdfError } = await resolvePdfPageCount(file);
-          processed.push({ id, file, category, pageCount, estimated, pdfError });
+          processed.push({ id, file, category, pageCount, totalPages: pageCount, estimated, pdfError });
         }
       }
       setFiles((prev) => [...prev, ...processed]);
@@ -285,7 +385,7 @@ export default function KioskPage() {
       const localId = Math.random().toString(36).slice(2);
       setFiles((prev) => [
         ...prev,
-        { id: localId, file, category, pageCount: 0, estimated: false, counting: true, countingStartedAt: Date.now() },
+        { id: localId, file, category, pageCount: 0, totalPages: 0, estimated: false, counting: true, countingStartedAt: Date.now() },
       ]);
 
       try {
@@ -322,6 +422,23 @@ export default function KioskPage() {
   const updatePageCount = (id: string, newCount: number) => {
     setFiles((prev) =>
       prev.map((f) => (f.id === id ? { ...f, pageCount: Math.max(1, Math.round(newCount) || 1) } : f))
+    );
+  };
+
+  const updatePageRange = (id: string, rawInput: string) => {
+    setFiles((prev) =>
+      prev.map((f) => {
+        if (f.id !== id) return f;
+        const { pages, error } = parsePageRange(rawInput, f.totalPages);
+        if (error) {
+          return { ...f, pageRangeError: error }; // keep previous valid pageCount/pageRange until fixed
+        }
+        if (pages.length === 0) {
+          // Empty input — back to printing everything.
+          return { ...f, pageRange: undefined, pageRangeError: undefined, pageCount: f.totalPages };
+        }
+        return { ...f, pageRange: pages.join(','), pageRangeError: undefined, pageCount: pages.length };
+      })
     );
   };
 
@@ -364,10 +481,14 @@ export default function KioskPage() {
   };
 
   const anyFileStillCounting = files.some((f) => f.counting);
+  const anyPageRangeError = files.some((f) => f.pageRangeError);
 
-  const getTotalPages = () => files.reduce((acc, f) => acc + f.pageCount, 0);
-  const getTotalCost = () => getTotalPages() * COST_PER_PAGE;
-  const getTotalSizeMB = () => (files.reduce((acc, f) => acc + f.file.size, 0) / (1024 * 1024)).toFixed(2);
+  const getItemUnitPrice = (item: UploadedFile) => (item.category === 'BLANK' ? BLANK_COST_PER_PAGE : COST_PER_PAGE);
+  const getPrintedPages = () => files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + f.pageCount, 0);
+  const getBlankPages = () => files.filter((f) => f.category === 'BLANK').reduce((acc, f) => acc + f.pageCount, 0);
+  const getTotalPages = () => getPrintedPages() + getBlankPages();
+  const getTotalCost = () => files.reduce((acc, f) => acc + f.pageCount * getItemUnitPrice(f), 0);
+  const getTotalSizeMB = () => (files.reduce((acc, f) => acc + (f.file?.size || 0), 0) / (1024 * 1024)).toFixed(2);
 
   const handleProceedToCheckout = async () => {
     setErrorMsg(null);
@@ -382,36 +503,58 @@ export default function KioskPage() {
           // covers the case where the person edited a failed-count fallback
           // — so the database (which the payment amount is computed from)
           // matches exactly what they're about to see on the payment screen.
-          const amount = item.pageCount * COST_PER_PAGE;
+          const amount = item.pageCount * getItemUnitPrice(item);
           const { error: updateError } = await supabase
             .from('print_jobs')
-            .update({ pages_count: item.pageCount, amount_paid: amount, status: 'PENDING' })
+            .update({ pages_count: item.pageCount, amount_paid: amount, status: 'PENDING', page_range: item.pageRange || null })
             .eq('id', item.jobId);
           if (updateError) throw updateError;
           jobIds.push(item.jobId);
           continue;
         }
 
+        if (item.category === 'BLANK') {
+          // No file at all — nothing to upload, straight to an insert.
+          const amount = item.pageCount * BLANK_COST_PER_PAGE;
+          const { data: jobRow, error: insertError } = await supabase
+            .from('print_jobs')
+            .insert({
+              printer_id: printerId,
+              file_type: 'BLANK',
+              file_name: `Blank pages x${item.pageCount}`,
+              storage_path: '',
+              pages_count: item.pageCount,
+              amount_paid: amount,
+              status: 'PENDING',
+            })
+            .select('id')
+            .single();
+          if (insertError) throw insertError;
+          jobIds.push(jobRow.id);
+          continue;
+        }
+
         // PDF / IMAGE: not uploaded yet, do it now.
-        const path = `${printerId}/${Date.now()}_${item.file.name}`;
+        const path = `${printerId}/${Date.now()}_${item.file!.name}`;
 
         const { error: uploadError } = await supabase.storage
           .from('print-files')
-          .upload(path, item.file, { upsert: false });
+          .upload(path, item.file!, { upsert: false });
         if (uploadError) throw uploadError;
 
-        const amount = item.pageCount * COST_PER_PAGE;
+        const amount = item.pageCount * getItemUnitPrice(item);
 
         const { data: jobRow, error: insertError } = await supabase
           .from('print_jobs')
           .insert({
             printer_id: printerId,
             file_type: item.category,
-            file_name: item.file.name,
+            file_name: item.file!.name,
             storage_path: path,
             pages_count: item.pageCount,
             amount_paid: amount,
             status: 'PENDING',
+            page_range: item.pageRange || null,
           })
           .select('id')
           .single();
@@ -606,7 +749,7 @@ export default function KioskPage() {
                   {(Object.keys(CATEGORY_META) as Category[]).map((cat) => {
                     const meta = CATEGORY_META[cat];
                     return (
-                      <div className="col-6 col-md-3" key={cat}>
+                      <div className="col-6 col-md-4 col-lg-3" key={cat}>
                         <button
                           disabled={!canUpload}
                           onClick={() => openPicker(cat)}
@@ -614,7 +757,7 @@ export default function KioskPage() {
                           style={{ background: meta.gradient }}
                         >
                           <i className={`bi ${meta.icon} fs-2`}></i>
-                          <span className="small fw-semibold">Upload {meta.label}</span>
+                          <span className="small fw-semibold">{cat === 'BLANK' ? meta.label : `Upload ${meta.label}`}</span>
                         </button>
                       </div>
                     );
@@ -648,10 +791,20 @@ export default function KioskPage() {
                   <div className="d-flex align-items-center gap-2">
                     <i className={`bi ${CATEGORY_META[selectedCategory].icon} text-info`}></i>
                     <h6 className="mb-0 fw-bold">
-                      {files.length > 0 ? `Selected Files (${files.length})` : `Add your ${CATEGORY_META[selectedCategory].label} files`}
+                      {selectedCategory === 'BLANK'
+                        ? 'Blank Pages'
+                        : files.length > 0
+                          ? `Selected Files (${files.length})`
+                          : `Add your ${CATEGORY_META[selectedCategory].label} files`}
                     </h6>
                   </div>
                 </div>
+
+                {selectedCategory === 'BLANK' && (
+                  <div className="card-body">
+                    <BlankPagesPicker onAdd={addBlankPages} unitPrice={BLANK_COST_PER_PAGE} />
+                  </div>
+                )}
 
                 {files.length > 0 && (
                   <div className="card-body p-2" style={{ maxHeight: '260px', overflowY: 'auto' }}>
@@ -660,7 +813,9 @@ export default function KioskPage() {
                         <div className="d-flex justify-content-between align-items-center">
                           <div className="d-flex align-items-center gap-2 text-truncate me-2">
                             <span className="badge bg-info text-dark">{item.category}</span>
-                            <span className="small text-truncate">{item.file.name}</span>
+                            <span className="small text-truncate">
+                              {item.category === 'BLANK' ? `Blank pages x${item.pageCount}` : item.file?.name}
+                            </span>
                           </div>
                           <div className="d-flex align-items-center gap-2">
                             {item.counting ? (
@@ -681,7 +836,13 @@ export default function KioskPage() {
                                 <span className="small text-secondary">pg (est.)</span>
                               </div>
                             ) : (
-                              <span className="small text-secondary">{item.pageCount} pg</span>
+                              <span className="small text-secondary">
+                                {item.category === 'BLANK'
+                                  ? `${item.pageCount} sheet${item.pageCount === 1 ? '' : 's'}`
+                                  : item.pageRange
+                                    ? `${item.pageCount} of ${item.totalPages} pg`
+                                    : `${item.pageCount} pg`}
+                              </span>
                             )}
                             <button
                               onClick={() => removeFile(item.id)}
@@ -710,23 +871,44 @@ export default function KioskPage() {
                             Taking longer than usual — the printer may be busy or briefly offline. Still waiting...
                           </p>
                         )}
+                        {!item.counting && !item.countFailed && !item.estimated && item.category !== 'IMAGE' && item.category !== 'BLANK' && item.totalPages > 1 && (
+                          <div className="mt-2">
+                            <input
+                              type="text"
+                              placeholder={`Print specific pages (e.g. 1-5, 8, 12-15) — leave blank for all ${item.totalPages}`}
+                              defaultValue={item.pageRange ? item.pageRange.split(',').join(', ') : ''}
+                              onChange={(e) => updatePageRange(item.id, e.target.value)}
+                              className="form-control form-control-sm bg-dark text-light border-secondary"
+                            />
+                            {item.pageRangeError && (
+                              <p className="small text-danger mb-0 mt-1">
+                                <i className="bi bi-exclamation-circle me-1"></i>
+                                {item.pageRangeError}
+                              </p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
                 )}
 
                 <div className="card-footer border-secondary d-flex flex-column gap-2">
-                  <button onClick={() => openPicker(selectedCategory)} className="btn btn-outline-info fw-semibold w-100 py-2">
-                    <i className="bi bi-plus-lg me-2"></i>
-                    {files.length > 0 ? `Add more ${CATEGORY_META[selectedCategory].label} files` : `Select ${CATEGORY_META[selectedCategory].label} files`}
-                  </button>
+                  {selectedCategory !== 'BLANK' && (
+                    <button onClick={() => openPicker(selectedCategory)} className="btn btn-outline-info fw-semibold w-100 py-2">
+                      <i className="bi bi-plus-lg me-2"></i>
+                      {files.length > 0 ? `Add more ${CATEGORY_META[selectedCategory].label} files` : `Select ${CATEGORY_META[selectedCategory].label} files`}
+                    </button>
+                  )}
 
                   {files.length > 0 && (
                     <>
-                      <div className="text-end small text-secondary">Size: {getTotalSizeMB()} / 350 MB</div>
+                      {files.some((f) => f.category !== 'BLANK') && (
+                        <div className="text-end small text-secondary">Size: {getTotalSizeMB()} / 350 MB</div>
+                      )}
                       <button
                         onClick={handleProceedToCheckout}
-                        disabled={!canUpload || isUploading || anyFileStillCounting}
+                        disabled={!canUpload || isUploading || anyFileStillCounting || anyPageRangeError}
                         className="btn btn-print fw-bold w-100 py-2"
                       >
                         {isUploading ? (
@@ -770,18 +952,22 @@ export default function KioskPage() {
                   <span className="text-secondary">Total Files Selected:</span>
                   <span className="fw-semibold">{files.length}</span>
                 </div>
-                <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-2">
-                  <span className="text-secondary">Total Calculated Pages:</span>
-                  <span className="fw-semibold">{getTotalPages()} Pages</span>
-                </div>
-                <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-3">
-                  <span className="text-secondary">Rate Per Page:</span>
-                  <span className="fw-semibold">₹{COST_PER_PAGE}.00 / page</span>
-                </div>
+                {getPrintedPages() > 0 && (
+                  <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-2">
+                    <span className="text-secondary">Printed Pages ({getPrintedPages()} × ₹{COST_PER_PAGE.toFixed(2)}):</span>
+                    <span className="fw-semibold">₹{(getPrintedPages() * COST_PER_PAGE).toFixed(2)}</span>
+                  </div>
+                )}
+                {getBlankPages() > 0 && (
+                  <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-3">
+                    <span className="text-secondary">Blank Sheets ({getBlankPages()} × ₹{BLANK_COST_PER_PAGE.toFixed(2)}):</span>
+                    <span className="fw-semibold">₹{(getBlankPages() * BLANK_COST_PER_PAGE).toFixed(2)}</span>
+                  </div>
+                )}
 
                 <div className="d-flex justify-content-between align-items-center mb-3">
                   <span className="h6 mb-0">Total Payable Amount:</span>
-                  <span className="h4 text-success fw-bold mb-0">₹{getTotalCost()}.00</span>
+                  <span className="h4 text-success fw-bold mb-0">₹{getTotalCost().toFixed(2)}</span>
                 </div>
 
                 <button
@@ -797,7 +983,7 @@ export default function KioskPage() {
                   ) : (
                     <>
                       <i className="bi bi-credit-card-fill me-2"></i>
-                      Pay ₹{getTotalCost()}.00 Now
+                      Pay ₹{getTotalCost().toFixed(2)} Now
                     </>
                   )}
                 </button>
