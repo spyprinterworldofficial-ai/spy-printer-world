@@ -17,7 +17,16 @@ export default function LoginScreen({ navigation }) {
     try {
       const { token } = await api.login(username, password);
       await saveToken(token);
-      await registerForPushNotifications();
+      // Push registration is best-effort and must never block getting into
+      // the app — it also simply doesn't work in Expo Go (removed since
+      // SDK 53; needs a proper development build). Any failure here is
+      // caught and swallowed inside registerForPushNotifications itself,
+      // but this extra guard makes sure that holds even if that changes.
+      try {
+        await registerForPushNotifications();
+      } catch (pushErr) {
+        console.log('Push registration skipped:', pushErr.message);
+      }
       navigation.replace('InstituteList');
     } catch (err) {
       Alert.alert('Login failed', err.message);

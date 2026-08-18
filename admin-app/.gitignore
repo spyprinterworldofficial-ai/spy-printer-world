@@ -5,18 +5,23 @@ node_modules/
 
 # Expo
 .expo/
+.expo-shared/
 dist/
 web-build/
+*.log
 expo-env.d.ts
 
 # Native
 .kotlin/
 *.orig.*
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
 *.mobileprovision
+google-services.json
+GoogleService-Info.plist
 
 # Metro
 .metro-health-check*

@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 // Using your laptop's LAN IP works fine for local testing on the same wifi
 // as your phone, e.g. 'http://192.168.1.42:4000' — 'localhost' will NOT
 // work from a physical phone, only from an emulator on the same machine.
-export const API_BASE_URL = 'http://192.168.1.42:4000';
+export const API_BASE_URL = 'https://spy-printer-world.onrender.com';
 
 const TOKEN_KEY = 'spy_admin_token';
 
