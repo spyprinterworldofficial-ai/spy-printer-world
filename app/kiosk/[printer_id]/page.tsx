@@ -10,7 +10,21 @@ declare global {
   }
 }
 
-const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB
+const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB across the whole order
+// Per-file caps, separate from the total-batch limit above. Images
+// specifically get a much smaller cap than documents — unlike a PDF
+// (already print-ready data) or PPT/DOC (converted once, deterministically,
+// on the Pi), a huge image has to be rasterized directly by the printer
+// driver, which is a real resource-exhaustion risk on a Pi 4 and can
+// produce corrupted/garbled print output if something goes wrong partway
+// through processing an unusually large file.
+const MAX_FILE_SIZE_BYTES: Record<Category, number> = {
+  IMAGE: 25 * 1024 * 1024, // 25 MB — generous for any real photo, far below anything that would strain the Pi
+  PDF: 100 * 1024 * 1024,
+  PPT: 100 * 1024 * 1024,
+  DOC: 100 * 1024 * 1024,
+  BLANK: Infinity, // no file involved at all
+};
 // Reads from NEXT_PUBLIC_COST_PER_PAGE (set in Vercel), falling back to 4
 // only if that env var is somehow missing. Must be kept in sync with
 // COST_PER_PAGE in create-razorpay-order/route.ts (server-side) and the Pi
@@ -359,6 +373,17 @@ export default function KioskPage() {
     }
 
     const category = selectedCategory;
+    const maxForCategory = MAX_FILE_SIZE_BYTES[category];
+    const oversized = newFiles.filter((f) => f.size > maxForCategory);
+    if (oversized.length > 0) {
+      const maxMB = (maxForCategory / (1024 * 1024)).toFixed(0);
+      setErrorMsg(
+        `${oversized.length > 1 ? 'Some files are' : `"${oversized[0].name}" is`} too large — ` +
+        `maximum allowed size for ${CATEGORY_META[category].label} is ${maxMB} MB per file.`
+      );
+      e.target.value = '';
+      return;
+    }
 
     if (category === 'PDF' || category === 'IMAGE') {
       // Instant, exact, no upload needed yet — same as before.
@@ -895,10 +920,15 @@ export default function KioskPage() {
 
                 <div className="card-footer border-secondary d-flex flex-column gap-2">
                   {selectedCategory !== 'BLANK' && (
-                    <button onClick={() => openPicker(selectedCategory)} className="btn btn-outline-info fw-semibold w-100 py-2">
-                      <i className="bi bi-plus-lg me-2"></i>
-                      {files.length > 0 ? `Add more ${CATEGORY_META[selectedCategory].label} files` : `Select ${CATEGORY_META[selectedCategory].label} files`}
-                    </button>
+                    <>
+                      <button onClick={() => openPicker(selectedCategory)} className="btn btn-outline-info fw-semibold w-100 py-2">
+                        <i className="bi bi-plus-lg me-2"></i>
+                        {files.length > 0 ? `Add more ${CATEGORY_META[selectedCategory].label} files` : `Select ${CATEGORY_META[selectedCategory].label} files`}
+                      </button>
+                      <p className="small text-secondary text-center mb-0">
+                        Max {(MAX_FILE_SIZE_BYTES[selectedCategory] / (1024 * 1024)).toFixed(0)} MB per file, 350 MB total per order
+                      </p>
+                    </>
                   )}
 
                   {files.length > 0 && (
