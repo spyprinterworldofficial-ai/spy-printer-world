@@ -18,6 +18,7 @@ const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB across the whole order
 // driver, which is a real resource-exhaustion risk on a Pi 4 and can
 // produce corrupted/garbled print output if something goes wrong partway
 // through processing an unusually large file.
+const MAX_COPIES = 20; // per file — keeps a single order from monopolizing the physical queue for hours
 const MAX_FILE_SIZE_BYTES: Record<Category, number> = {
   IMAGE: 25 * 1024 * 1024, // 25 MB — generous for any real photo, far below anything that would strain the Pi
   PDF: 100 * 1024 * 1024,
@@ -61,6 +62,7 @@ interface UploadedFile {
   category: Category;
   pageCount: number; // BILLED count — equals totalPages unless a page range is selected
   totalPages: number; // the real full-document page count, used to validate ranges against
+  copies: number; // how many times to print this same file — multiplies price and physical output
   estimated: boolean; // true when the count is an editable fallback, not exact
   pdfError?: string;
   pageRange?: string; // fully-expanded, deduped, sorted comma list e.g. "1,3,5,6" — undefined means "print everything"
@@ -353,6 +355,7 @@ export default function KioskPage() {
         category: 'BLANK',
         pageCount: qty,
         totalPages: qty,
+        copies: 1,
         estimated: false,
       },
     ]);
@@ -391,10 +394,10 @@ export default function KioskPage() {
       for (const file of newFiles) {
         const id = Math.random().toString(36).slice(2);
         if (category === 'IMAGE') {
-          processed.push({ id, file, category, pageCount: 1, totalPages: 1, estimated: false });
+          processed.push({ id, file, category, pageCount: 1, totalPages: 1, copies: 1, estimated: false });
         } else {
           const { pageCount, estimated, pdfError } = await resolvePdfPageCount(file);
-          processed.push({ id, file, category, pageCount, totalPages: pageCount, estimated, pdfError });
+          processed.push({ id, file, category, pageCount, totalPages: pageCount, copies: 1, estimated, pdfError });
         }
       }
       setFiles((prev) => [...prev, ...processed]);
@@ -410,7 +413,7 @@ export default function KioskPage() {
       const localId = Math.random().toString(36).slice(2);
       setFiles((prev) => [
         ...prev,
-        { id: localId, file, category, pageCount: 0, totalPages: 0, estimated: false, counting: true, countingStartedAt: Date.now() },
+        { id: localId, file, category, pageCount: 0, totalPages: 0, copies: 1, estimated: false, counting: true, countingStartedAt: Date.now() },
       ]);
 
       try {
@@ -448,6 +451,11 @@ export default function KioskPage() {
     setFiles((prev) =>
       prev.map((f) => (f.id === id ? { ...f, pageCount: Math.max(1, Math.round(newCount) || 1) } : f))
     );
+  };
+
+  const updateCopies = (id: string, newCopies: number) => {
+    const clamped = Math.min(MAX_COPIES, Math.max(1, Math.round(newCopies) || 1));
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, copies: clamped } : f)));
   };
 
   const updatePageRange = (id: string, rawInput: string) => {
@@ -509,11 +517,42 @@ export default function KioskPage() {
   const anyPageRangeError = files.some((f) => f.pageRangeError);
 
   const getItemUnitPrice = (item: UploadedFile) => (item.category === 'BLANK' ? BLANK_COST_PER_PAGE : COST_PER_PAGE);
-  const getPrintedPages = () => files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + f.pageCount, 0);
-  const getBlankPages = () => files.filter((f) => f.category === 'BLANK').reduce((acc, f) => acc + f.pageCount, 0);
+  const getItemTotalPages = (item: UploadedFile) => item.pageCount * item.copies;
+  const getPrintedPages = () => files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
+  const getBlankPages = () => files.filter((f) => f.category === 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
   const getTotalPages = () => getPrintedPages() + getBlankPages();
-  const getTotalCost = () => files.reduce((acc, f) => acc + f.pageCount * getItemUnitPrice(f), 0);
+  const getTotalCost = () => files.reduce((acc, f) => acc + getItemTotalPages(f) * getItemUnitPrice(f), 0);
   const getTotalSizeMB = () => (files.reduce((acc, f) => acc + (f.file?.size || 0), 0) / (1024 * 1024)).toFixed(2);
+
+  // Uploads a file, then verifies the byte count that actually landed in
+  // Storage matches the original file exactly. Some mobile browsers
+  // (aggressive background-tab throttling / OEM browsers like certain
+  // Vivo/IQOO/Brave builds) can report an upload as successful while the
+  // data was actually truncated mid-transfer — the file "exists" but is
+  // corrupted. Left unchecked, the Pi would later download that broken
+  // file, CUPS/the printer driver might still accept it without erroring,
+  // and the job would get marked COMPLETED despite nothing valid ever
+  // printing. Retries once (a fresh attempt on a flaky connection often
+  // just works), then fails loudly rather than silently continuing with
+  // bad data.
+  const uploadFileVerified = async (path: string, file: File): Promise<void> => {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { error: uploadError } = await supabase.storage.from('print-files').upload(path, file, { upsert: attempt > 1 });
+      if (uploadError) throw uploadError;
+
+      const { data: listing, error: listError } = await supabase.storage
+        .from('print-files')
+        .list(path.substring(0, path.lastIndexOf('/')), { search: path.substring(path.lastIndexOf('/') + 1) });
+      const uploadedSize = listing?.[0]?.metadata?.size;
+
+      if (!listError && uploadedSize === file.size) return; // verified good
+
+      console.error(`Upload verification failed on attempt ${attempt}: expected ${file.size} bytes, got ${uploadedSize}`);
+      if (attempt === 2) {
+        throw new Error(`The uploaded file appears corrupted or incomplete (this can happen on some mobile browsers) — please try again, or try a different browser if this keeps happening.`);
+      }
+    }
+  };
 
   const handleProceedToCheckout = async () => {
     setErrorMsg(null);
@@ -528,10 +567,10 @@ export default function KioskPage() {
           // covers the case where the person edited a failed-count fallback
           // — so the database (which the payment amount is computed from)
           // matches exactly what they're about to see on the payment screen.
-          const amount = item.pageCount * getItemUnitPrice(item);
+          const amount = item.pageCount * item.copies * getItemUnitPrice(item);
           const { error: updateError } = await supabase
             .from('print_jobs')
-            .update({ pages_count: item.pageCount, amount_paid: amount, status: 'PENDING', page_range: item.pageRange || null })
+            .update({ pages_count: item.pageCount, copies: item.copies, amount_paid: amount, status: 'PENDING', page_range: item.pageRange || null })
             .eq('id', item.jobId);
           if (updateError) throw updateError;
           jobIds.push(item.jobId);
@@ -540,7 +579,7 @@ export default function KioskPage() {
 
         if (item.category === 'BLANK') {
           // No file at all — nothing to upload, straight to an insert.
-          const amount = item.pageCount * BLANK_COST_PER_PAGE;
+          const amount = item.pageCount * item.copies * BLANK_COST_PER_PAGE;
           const { data: jobRow, error: insertError } = await supabase
             .from('print_jobs')
             .insert({
@@ -549,6 +588,7 @@ export default function KioskPage() {
               file_name: `Blank pages x${item.pageCount}`,
               storage_path: '',
               pages_count: item.pageCount,
+              copies: item.copies,
               amount_paid: amount,
               status: 'PENDING',
             })
@@ -561,13 +601,9 @@ export default function KioskPage() {
 
         // PDF / IMAGE: not uploaded yet, do it now.
         const path = `${printerId}/${Date.now()}_${item.file!.name}`;
+        await uploadFileVerified(path, item.file!);
 
-        const { error: uploadError } = await supabase.storage
-          .from('print-files')
-          .upload(path, item.file!, { upsert: false });
-        if (uploadError) throw uploadError;
-
-        const amount = item.pageCount * getItemUnitPrice(item);
+        const amount = item.pageCount * item.copies * getItemUnitPrice(item);
 
         const { data: jobRow, error: insertError } = await supabase
           .from('print_jobs')
@@ -577,6 +613,7 @@ export default function KioskPage() {
             file_name: item.file!.name,
             storage_path: path,
             pages_count: item.pageCount,
+            copies: item.copies,
             amount_paid: amount,
             status: 'PENDING',
             page_range: item.pageRange || null,
@@ -878,6 +915,41 @@ export default function KioskPage() {
                             </button>
                           </div>
                         </div>
+                        {!item.counting && !item.countFailed && (
+                          <div className="mt-2 d-flex align-items-center gap-2">
+                            <span className="small text-secondary">Copies:</span>
+                            <button
+                              onClick={() => updateCopies(item.id, item.copies - 1)}
+                              disabled={item.copies <= 1}
+                              className="btn btn-sm btn-outline-secondary rounded-circle p-0"
+                              style={{ width: '26px', height: '26px', lineHeight: 1 }}
+                            >
+                              <i className="bi bi-dash"></i>
+                            </button>
+                            <input
+                              type="number"
+                              min={1}
+                              max={MAX_COPIES}
+                              value={item.copies}
+                              onChange={(e) => updateCopies(item.id, Number(e.target.value))}
+                              className="form-control form-control-sm bg-dark text-light border-secondary text-center"
+                              style={{ width: '50px' }}
+                            />
+                            <button
+                              onClick={() => updateCopies(item.id, item.copies + 1)}
+                              disabled={item.copies >= MAX_COPIES}
+                              className="btn btn-sm btn-outline-secondary rounded-circle p-0"
+                              style={{ width: '26px', height: '26px', lineHeight: 1 }}
+                            >
+                              <i className="bi bi-plus"></i>
+                            </button>
+                            {item.copies > 1 && (
+                              <span className="small text-info">
+                                = {getItemTotalPages(item)} {item.category === 'BLANK' ? 'sheets' : 'pages'} total, ₹{(getItemTotalPages(item) * getItemUnitPrice(item)).toFixed(2)}
+                              </span>
+                            )}
+                          </div>
+                        )}
                         {item.countFailed && (
                           <p className="small text-warning mb-0 mt-1">
                             <i className="bi bi-info-circle me-1"></i>
