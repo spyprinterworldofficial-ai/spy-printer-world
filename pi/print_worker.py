@@ -127,6 +127,29 @@ def download_job_file(storage_path: str, dest_path: Path):
     data = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
     dest_path.write_bytes(data)
 
+def warm_up_libreoffice():
+    """LibreOffice's first headless invocation after being idle pays a
+    one-time ~20s startup cost (profile init, font loading) completely
+    separate from actual conversion time — every invocation after that,
+    while it stays "warm", is near-instant. Without this, whoever's PPT/DOC
+    happens to be the first one processed after a period of inactivity eats
+    that entire 20s penalty themselves, which is exactly what made one
+    person's file feel unusually slow compared to others. Running this once
+    at service startup absorbs that cost upfront instead."""
+    print("[startup] warming up LibreOffice...")
+    start = time.time()
+    try:
+        subprocess.run(
+            ["libreoffice", "--headless", "--terminate_after_init"],
+            timeout=40, capture_output=True,
+        )
+        print(f"[startup] LibreOffice warmed up in {time.time() - start:.1f}s")
+    except Exception as e:
+        # Non-fatal — worst case, the first real job just pays the cold
+        # start cost itself, same as before this fix existed.
+        print(f"[startup] LibreOffice warmup failed (non-fatal): {e}")
+
+
 
 def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
     """Uses headless LibreOffice to convert PPT/DOC files to PDF. Used both
@@ -145,6 +168,7 @@ def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
     if not pdf_path.exists():
         raise RuntimeError(f"LibreOffice conversion did not produce {pdf_path}")
     return pdf_path
+
 
 
 def get_pdf_page_count(pdf_path: Path) -> int:
@@ -435,4 +459,5 @@ def main_loop():
 
 
 if __name__ == "__main__":
+    warm_up_libreoffice()
     main_loop()
