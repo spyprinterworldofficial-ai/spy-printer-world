@@ -6,11 +6,16 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0a0e12",
+    "icon": "./assets/spy-logo.png",
     "android": {
       "package": "com.spyprinterworld.admin",
       "permissions": [
         "NOTIFICATIONS"
-      ]
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/spy-logo.png",
+        "backgroundColor": "#0a0e12"
+      }
     },
     "plugins": [
       "expo-notifications"

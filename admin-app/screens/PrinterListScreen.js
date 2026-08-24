@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
 import { api } from '../api/client';
-import { isInternetOnline, isPrinterConnected } from '../utils/printerStatus';
+import { isInternetOnline, isPrinterConnected } from '../utils/printerStatus.js';
 
 export default function PrinterListScreen({ route, navigation }) {
   const { instituteId, instituteName } = route.params;
