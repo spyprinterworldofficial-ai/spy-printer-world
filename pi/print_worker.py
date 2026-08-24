@@ -42,6 +42,9 @@ POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 # determines the charge now, server-side, not the browser.
 COST_PER_PAGE = int(os.environ.get("COST_PER_PAGE", "4"))
 
+last_libreoffice_activity = 0.0
+LIBREOFFICE_KEEPWARM_INTERVAL = 25  # seconds — shorter than the ~60-70s "warm" window we measured
+
 STORAGE_BUCKET = "print-files"
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -128,30 +131,23 @@ def download_job_file(storage_path: str, dest_path: Path):
     dest_path.write_bytes(data)
 
 def warm_up_libreoffice():
-    """LibreOffice's first headless invocation after being idle pays a
-    one-time ~20s startup cost (profile init, font loading) completely
-    separate from actual conversion time — every invocation after that,
-    while it stays "warm", is near-instant. Without this, whoever's PPT/DOC
-    happens to be the first one processed after a period of inactivity eats
-    that entire 20s penalty themselves, which is exactly what made one
-    person's file feel unusually slow compared to others. Running this once
-    at service startup absorbs that cost upfront instead."""
-    print("[startup] warming up LibreOffice...")
+    global last_libreoffice_activity
+    print("[keepwarm] warming up LibreOffice...")
     start = time.time()
     try:
         subprocess.run(
             ["libreoffice", "--headless", "--terminate_after_init"],
             timeout=40, capture_output=True,
         )
-        print(f"[startup] LibreOffice warmed up in {time.time() - start:.1f}s")
+        print(f"[keepwarm] LibreOffice warmed up in {time.time() - start:.1f}s")
     except Exception as e:
-        # Non-fatal — worst case, the first real job just pays the cold
-        # start cost itself, same as before this fix existed.
-        print(f"[startup] LibreOffice warmup failed (non-fatal): {e}")
-
+        print(f"[keepwarm] LibreOffice warmup failed (non-fatal): {e}")
+    last_libreoffice_activity = time.time()
 
 
 def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
+    global last_libreoffice_activity
+    last_libreoffice_activity = time.time()
     """Uses headless LibreOffice to convert PPT/DOC files to PDF. Used both
     for actual printing and for exact page counting (below) — the same
     conversion either way, so the count the person pays for and the pages
@@ -459,5 +455,6 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    warm_up_libreoffice()
+    if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
+        warm_up_libreoffice()
     main_loop()
