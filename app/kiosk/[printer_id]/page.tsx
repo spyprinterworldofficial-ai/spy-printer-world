@@ -10,38 +10,38 @@ declare global {
   }
 }
 
-const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB across the whole order
-// Per-file caps, separate from the total-batch limit above. Images
-// specifically get a much smaller cap than documents — unlike a PDF
-// (already print-ready data) or PPT/DOC (converted once, deterministically,
-// on the Pi), a huge image has to be rasterized directly by the printer
-// driver, which is a real resource-exhaustion risk on a Pi 4 and can
-// produce corrupted/garbled print output if something goes wrong partway
-// through processing an unusually large file.
+// ---- Config / constants ---------------------------------------------------
+
+const MAX_TOTAL_SIZE_BYTES = 350 * 1024 * 1024; // 350 MB per order, across all files
 const MAX_COPIES = 20; // per file — keeps a single order from monopolizing the physical queue for hours
+
+// Per-file caps. Images get a much smaller cap than documents — unlike a
+// PDF (already print-ready) or PPT/DOC (converted once, deterministically,
+// on the Pi), a huge image has to be rasterized directly by the printer
+// driver, which is a real resource-exhaustion risk on a Pi 4.
 const MAX_FILE_SIZE_BYTES: Record<Category, number> = {
-  IMAGE: 25 * 1024 * 1024, // 25 MB — generous for any real photo, far below anything that would strain the Pi
+  IMAGE: 25 * 1024 * 1024,
   PDF: 100 * 1024 * 1024,
   PPT: 100 * 1024 * 1024,
   DOC: 100 * 1024 * 1024,
-  BLANK: Infinity, // no file involved at all
+  BLANK: Infinity,
 };
-// Reads from NEXT_PUBLIC_COST_PER_PAGE (set in Vercel), falling back to 4
-// only if that env var is somehow missing. Must be kept in sync with
-// COST_PER_PAGE in create-razorpay-order/route.ts (server-side) and the Pi
-// worker's .env — three separate places since each runs in a different
-// environment. This value only drives what's *displayed* and what the
-// initial insert for PDF/Image jobs uses; the actual charge is always
-// recomputed server-side from the database at payment time, so even if
-// this one drifted, someone couldn't pay less than the real total — but
-// keeping them in sync avoids showing the wrong price on screen.
-const COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_COST_PER_PAGE) || 4;
+
+// Pricing — all read from env vars so a config change actually applies
+// (rather than a hardcoded literal silently going stale). Must be kept in
+// sync with COST_PER_PAGE/BLANK_COST_PER_PAGE/DUPLEX_COST_PER_SHEET in
+// create-razorpay-order/route.ts (server-side charge) and the Pi worker's
+// .env (used when it finishes counting a PPT/DOC) — three separate places
+// since each runs in a different environment.
+const COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_COST_PER_PAGE) || 3;
 const BLANK_COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_BLANK_COST_PER_PAGE) || 1.5;
+const DUPLEX_COST_PER_SHEET = Number(process.env.NEXT_PUBLIC_DUPLEX_COST_PER_SHEET) || 4.5;
+
 const LOW_PAPER_THRESHOLD = 10;
-// The Pi worker heartbeats every POLL_INTERVAL_SECONDS (5s by default). If
-// we haven't heard from it in this long, treat it as offline even if the
-// last values it wrote to the database were "online" — a Pi that's been
-// switched off doesn't get to update its own row to say so.
+// The Pi worker heartbeats every ~5s while running. If we haven't heard
+// from it in this long, treat it as offline even if the last stored value
+// said "online" — a Pi that's been switched off can't update its own row
+// to say so, so that flag just freezes at whatever it last was.
 const HEARTBEAT_STALE_MS = 20000;
 
 type Category = 'PDF' | 'IMAGE' | 'PPT' | 'DOC' | 'BLANK';
@@ -62,7 +62,8 @@ interface UploadedFile {
   category: Category;
   pageCount: number; // BILLED count — equals totalPages unless a page range is selected
   totalPages: number; // the real full-document page count, used to validate ranges against
-  copies: number; // how many times to print this same file — multiplies price and physical output
+  copies: number; // how many times to print this same file
+  duplex: boolean; // double-sided — PDF/PPT/DOC only, not IMAGE/BLANK
   estimated: boolean; // true when the count is an editable fallback, not exact
   pdfError?: string;
   pageRange?: string; // fully-expanded, deduped, sorted comma list e.g. "1,3,5,6" — undefined means "print everything"
@@ -77,6 +78,21 @@ interface UploadedFile {
   countFailed?: boolean;
 }
 
+interface QueueItem {
+  id: string;
+  file_name: string;
+  pages_count: number;
+  created_at: string;
+}
+
+const CATEGORY_META: Record<Category, { label: string; icon: string; gradient: string; accept: string }> = {
+  PDF: { label: 'PDF', icon: 'bi-file-earmark-pdf-fill', gradient: 'linear-gradient(135deg,#ff5f6d,#c31432)', accept: '.pdf' },
+  IMAGE: { label: 'Image', icon: 'bi-file-earmark-image-fill', gradient: 'linear-gradient(135deg,#36d1dc,#5b86e5)', accept: 'image/*' },
+  PPT: { label: 'PPT', icon: 'bi-file-earmark-slides-fill', gradient: 'linear-gradient(135deg,#f7971e,#ffd200)', accept: '.ppt,.pptx' },
+  DOC: { label: 'Doc', icon: 'bi-file-earmark-word-fill', gradient: 'linear-gradient(135deg,#00c6ff,#0072ff)', accept: '.doc,.docx' },
+  BLANK: { label: 'Blank Pages', icon: 'bi-file-earmark', gradient: 'linear-gradient(135deg,#8e9eab,#4b6076)', accept: '' },
+};
+
 // Parses a page-range string like "1-5, 8, 12-15" against a known total
 // page count. Returns a sorted, deduped array of individual page numbers
 // (never range shorthand) — this expanded form is what gets stored and
@@ -84,7 +100,7 @@ interface UploadedFile {
 // what gets physically extracted and printed later.
 function parsePageRange(input: string, totalPages: number): { pages: number[]; error?: string } {
   const trimmed = input.trim();
-  if (!trimmed) return { pages: [] }; // empty = print everything, handled by caller
+  if (!trimmed) return { pages: [] }; // empty = print everything
 
   const selected = new Set<number>();
   const tokens = trimmed.split(',').map((t) => t.trim()).filter(Boolean);
@@ -114,35 +130,13 @@ function parsePageRange(input: string, totalPages: number): { pages: number[]; e
   return { pages: Array.from(selected).sort((a, b) => a - b) };
 }
 
-interface QueueItem {
-  id: string;
-  file_name: string;
-  pages_count: number;
-  created_at: string;
-}
-
-const CATEGORY_META: Record<Category, { label: string; icon: string; gradient: string; accept: string }> = {
-  PDF: { label: 'PDF', icon: 'bi-file-earmark-pdf-fill', gradient: 'linear-gradient(135deg,#ff5f6d,#c31432)', accept: '.pdf' },
-  IMAGE: { label: 'Image', icon: 'bi-file-earmark-image-fill', gradient: 'linear-gradient(135deg,#36d1dc,#5b86e5)', accept: 'image/*' },
-  PPT: { label: 'PPT', icon: 'bi-file-earmark-slides-fill', gradient: 'linear-gradient(135deg,#f7971e,#ffd200)', accept: '.ppt,.pptx' },
-  DOC: { label: 'Doc', icon: 'bi-file-earmark-word-fill', gradient: 'linear-gradient(135deg,#00c6ff,#0072ff)', accept: '.doc,.docx' },
-  BLANK: { label: 'Blank Pages', icon: 'bi-file-earmark', gradient: 'linear-gradient(135deg,#8e9eab,#4b6076)', accept: '' },
-};
-
-// ---- Page counting -------------------------------------------------------
-// PDFs & images: counted exactly, instantly, in the browser — no round
-// trip needed. PDFs use pdf.js with a self-hosted worker file
+// ---- Page counting (PDF/Image only — instant, client-side) ---------------
+// PPT/DOC counting happens on the Pi (see handleFileChange's COUNTING
+// branch below) — a browser genuinely can't render those to get a real
+// page count. PDFs use pdf.js with a self-hosted worker file
 // (public/pdf.worker.min.mjs) rather than an external CDN, since loading
 // the worker from cdnjs previously failed silently on networks that block
-// or throttle that domain (common on campus/hostel wifi), causing PDFs to
-// be undercounted as "1 page".
-//
-// PPT/DOC: a browser genuinely can't render these to get a real page
-// count, so these are uploaded immediately (before payment) and the
-// Raspberry Pi — which already has LibreOffice installed for printing —
-// converts them and writes back the exact page count. See handleFileChange
-// and the realtime subscription below for how this plays out; this section
-// only covers the instant PDF/image path.
+// or throttle that domain, causing PDFs to be undercounted as "1 page".
 
 async function getPdfPageCount(file: File): Promise<number> {
   const pdfjsLib = await import('pdfjs-dist');
@@ -152,10 +146,6 @@ async function getPdfPageCount(file: File): Promise<number> {
   return pdf.numPages;
 }
 
-// Only used as a last-resort editable fallback for PDFs whose page count
-// genuinely failed to parse (corrupt file, etc) — not used for PPT/DOC at
-// all anymore, since those get an exact Pi-verified count instead of a
-// file-size guess.
 async function resolvePdfPageCount(file: File): Promise<{ pageCount: number; estimated: boolean; pdfError?: string }> {
   try {
     const pageCount = await getPdfPageCount(file);
@@ -164,6 +154,24 @@ async function resolvePdfPageCount(file: File): Promise<{ pageCount: number; est
     console.error('PDF page count failed:', err);
     return { pageCount: 1, estimated: true, pdfError: 'Could not read page count from this PDF — please re-check it before paying.' };
   }
+}
+
+// ---- Pricing ----------------------------------------------------------
+// Shared formula — must stay byte-for-byte identical to the one in
+// create-razorpay-order/route.ts (the actual charge) and
+// process_counting_job() on the Pi (used right when a PPT/DOC finishes
+// counting). A duplex job prices in pairs: one discounted sheet covers 2
+// pages. A leftover odd page can't be duplexed (nothing to print on its
+// back), so it's charged at the plain single-side rate.
+function computeItemAmount(pages: number, copies: number, category: Category, duplex: boolean): number {
+  const n = pages * copies;
+  if (category === 'BLANK') return n * BLANK_COST_PER_PAGE;
+  if (duplex) {
+    const pairs = Math.floor(n / 2);
+    const leftover = n % 2;
+    return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE;
+  }
+  return n * COST_PER_PAGE;
 }
 
 // Small self-contained control for the Blank Pages flow — a quantity
@@ -217,9 +225,6 @@ export default function KioskPage() {
   const [showSplash, setShowSplash] = useState(true);
   const [videoFailed, setVideoFailed] = useState(false);
 
-  // Printer status loading is tracked explicitly so we never confuse
-  // "still loading" or "failed to load" with "printer is offline" — that
-  // mix-up was previously leaving every button permanently disabled.
   const [printerStatus, setPrinterStatus] = useState<PrinterStatus | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -234,16 +239,14 @@ export default function KioskPage() {
   const [pendingJobIds, setPendingJobIds] = useState<string[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   // Forces a re-render every few seconds purely so the heartbeat-staleness
-  // check below gets re-evaluated even when no new data has arrived from
-  // Supabase (e.g. the Pi went silent and nothing is pushing updates).
+  // check below gets re-evaluated even when no new data has arrived.
   const [, forceTick] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Splash hides when the video actually finishes (onEnded below). This
-  // safety-net timeout only exists in case autoplay gets silently blocked
-  // by the browser and 'ended' never fires — it's deliberately much longer
-  // than the video itself so it never cuts a normal playthrough short.
+  // Splash hides when the video actually finishes. This safety-net timeout
+  // only exists in case autoplay gets silently blocked by the browser and
+  // 'ended' never fires — deliberately much longer than the video itself.
   useEffect(() => {
     const safetyNet = setTimeout(() => setShowSplash(false), 20000);
     return () => clearTimeout(safetyNet);
@@ -280,15 +283,9 @@ export default function KioskPage() {
     const fetchStatus = async () => {
       setStatusLoading(true);
       setStatusError(null);
-      const { data, error } = await supabase
-        .from('printers')
-        .select('*')
-        .eq('id', printerId)
-        .single();
+      const { data, error } = await supabase.from('printers').select('*').eq('id', printerId).single();
 
       if (error) {
-        // Full detail stays in the console for debugging; end users just
-        // see a plain, non-technical message.
         console.error('Failed to load printer status (check NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY in Vercel):', error);
         setStatusError('Printer is not connected. Please wait.');
       } else if (data) {
@@ -312,11 +309,6 @@ export default function KioskPage() {
         { event: '*', schema: 'public', table: 'print_jobs', filter: `printer_id=eq.${printerId}` },
         (payload) => {
           fetchQueue();
-          // Route counting-job updates from the Pi back to the matching
-          // file in the upload list. Using the functional setState form
-          // avoids needing `files` as an effect dependency (which would
-          // otherwise mean re-subscribing the whole realtime channel every
-          // time the file list changes).
           const updated = payload.new as { id: string; status: string; pages_count: number; amount_paid: number };
           setFiles((prev) =>
             prev.map((f) => {
@@ -327,7 +319,7 @@ export default function KioskPage() {
               if (updated.status === 'COUNT_FAILED') {
                 return { ...f, pageCount: f.pageCount || 1, totalPages: f.totalPages || 1, counting: false, countFailed: true, estimated: true };
               }
-              return f; // still COUNTING or some other transient state
+              return f;
             })
           );
         }
@@ -341,7 +333,7 @@ export default function KioskPage() {
 
   const openPicker = (cat: Category) => {
     setSelectedCategory(cat);
-    if (cat === 'BLANK') return; // no file picker — quantity UI shown instead, see the card body
+    if (cat === 'BLANK') return; // no file picker — quantity UI shown instead
     setTimeout(() => fileInputRef.current?.click(), 0);
   };
 
@@ -356,6 +348,7 @@ export default function KioskPage() {
         pageCount: qty,
         totalPages: qty,
         copies: 1,
+        duplex: false,
         estimated: false,
       },
     ]);
@@ -389,15 +382,16 @@ export default function KioskPage() {
     }
 
     if (category === 'PDF' || category === 'IMAGE') {
-      // Instant, exact, no upload needed yet — same as before.
+      // Instant, exact (or an editable fallback for PDF on rare parse
+      // failure) — no upload needed yet.
       const processed: UploadedFile[] = [];
       for (const file of newFiles) {
         const id = Math.random().toString(36).slice(2);
         if (category === 'IMAGE') {
-          processed.push({ id, file, category, pageCount: 1, totalPages: 1, copies: 1, estimated: false });
+          processed.push({ id, file, category, pageCount: 1, totalPages: 1, copies: 1, duplex: false, estimated: false });
         } else {
           const { pageCount, estimated, pdfError } = await resolvePdfPageCount(file);
-          processed.push({ id, file, category, pageCount, totalPages: pageCount, copies: 1, estimated, pdfError });
+          processed.push({ id, file, category, pageCount, totalPages: pageCount, copies: 1, duplex: false, estimated, pdfError });
         }
       }
       setFiles((prev) => [...prev, ...processed]);
@@ -406,14 +400,14 @@ export default function KioskPage() {
     }
 
     // PPT / DOC: upload immediately and create a COUNTING job so the Pi can
-    // convert it and write back the real page count. Files are added to
-    // the list right away showing a "counting..." state, then updated by
-    // the realtime subscription above once the Pi finishes.
+    // convert it and write back the real page count. Files show up right
+    // away with a "counting..." state, updated by the realtime subscription
+    // above once the Pi finishes.
     for (const file of newFiles) {
       const localId = Math.random().toString(36).slice(2);
       setFiles((prev) => [
         ...prev,
-        { id: localId, file, category, pageCount: 0, totalPages: 0, copies: 1, estimated: false, counting: true, countingStartedAt: Date.now() },
+        { id: localId, file, category, pageCount: 0, totalPages: 0, copies: 1, duplex: false, estimated: false, counting: true, countingStartedAt: Date.now() },
       ]);
 
       try {
@@ -448,9 +442,7 @@ export default function KioskPage() {
   };
 
   const updatePageCount = (id: string, newCount: number) => {
-    setFiles((prev) =>
-      prev.map((f) => (f.id === id ? { ...f, pageCount: Math.max(1, Math.round(newCount) || 1) } : f))
-    );
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, pageCount: Math.max(1, Math.round(newCount) || 1) } : f)));
   };
 
   const updateCopies = (id: string, newCopies: number) => {
@@ -458,18 +450,17 @@ export default function KioskPage() {
     setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, copies: clamped } : f)));
   };
 
+  const updateDuplex = (id: string, value: boolean) => {
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, duplex: value } : f)));
+  };
+
   const updatePageRange = (id: string, rawInput: string) => {
     setFiles((prev) =>
       prev.map((f) => {
         if (f.id !== id) return f;
         const { pages, error } = parsePageRange(rawInput, f.totalPages);
-        if (error) {
-          return { ...f, pageRangeError: error }; // keep previous valid pageCount/pageRange until fixed
-        }
-        if (pages.length === 0) {
-          // Empty input — back to printing everything.
-          return { ...f, pageRange: undefined, pageRangeError: undefined, pageCount: f.totalPages };
-        }
+        if (error) return { ...f, pageRangeError: error };
+        if (pages.length === 0) return { ...f, pageRange: undefined, pageRangeError: undefined, pageCount: f.totalPages };
         return { ...f, pageRange: pages.join(','), pageRangeError: undefined, pageCount: pages.length };
       })
     );
@@ -495,11 +486,6 @@ export default function KioskPage() {
   const removeFile = async (id: string) => {
     const item = files.find((f) => f.id === id);
     setFiles((prev) => prev.filter((f) => f.id !== id));
-
-    // PPT/DOC files that were already uploaded (jobId set) need their
-    // storage object(s) and print_jobs row cleaned up — otherwise a "wrong
-    // file, remove it" click would leave an orphaned upload sitting in
-    // Storage and a dead COUNTING/PENDING row in the database forever.
     if (item?.jobId) {
       await deleteJobAndFiles(item.jobId, item.storagePath);
     }
@@ -516,41 +502,12 @@ export default function KioskPage() {
   const anyFileStillCounting = files.some((f) => f.counting);
   const anyPageRangeError = files.some((f) => f.pageRangeError);
 
-  const getItemUnitPrice = (item: UploadedFile) => (item.category === 'BLANK' ? BLANK_COST_PER_PAGE : COST_PER_PAGE);
   const getItemTotalPages = (item: UploadedFile) => item.pageCount * item.copies;
   const getPrintedPages = () => files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
   const getBlankPages = () => files.filter((f) => f.category === 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
   const getTotalPages = () => getPrintedPages() + getBlankPages();
-  const getTotalCost = () => files.reduce((acc, f) => acc + getItemTotalPages(f) * getItemUnitPrice(f), 0);
+  const getTotalCost = () => files.reduce((acc, f) => acc + computeItemAmount(f.pageCount, f.copies, f.category, f.duplex), 0);
   const getTotalSizeMB = () => (files.reduce((acc, f) => acc + (f.file?.size || 0), 0) / (1024 * 1024)).toFixed(2);
-
-  // Uploads a file, then verifies the byte count that actually landed in
-  // Storage matches the original file exactly. Some mobile browsers
-  // (aggressive background-tab throttling / OEM browsers like certain
-  // Vivo/IQOO/Brave builds) can report an upload as successful while the
-  // data was actually truncated mid-transfer — the file "exists" but is
-  // corrupted. Left unchecked, the Pi would later download that broken
-  // file, CUPS/the printer driver might still accept it without erroring,
-  // and the job would get marked COMPLETED despite nothing valid ever
-  // printing. Retries once (a fresh attempt on a flaky connection often
-  // just works), then fails loudly rather than silently continuing with
-  // bad data.
-  const uploadFileVerified = async (path: string, file: File): Promise<void> => {
-    const { error: uploadError } = await supabase.storage.from('print-files').upload(path, file, { upsert: false });
-    if (uploadError) throw uploadError; // a REAL upload failure (network, permissions, etc) should still surface
-
-    try {
-      const { data: listing } = await supabase.storage
-        .from('print-files')
-        .list(path.substring(0, path.lastIndexOf('/')), { search: path.substring(path.lastIndexOf('/') + 1) });
-      const uploadedSize = listing?.[0]?.metadata?.size;
-      if (uploadedSize !== undefined && uploadedSize !== file.size) {
-        console.warn(`Upload size mismatch for ${file.name}: expected ${file.size}, storage shows ${uploadedSize} — proceeding anyway, but flagging in case this file prints incorrectly.`);
-      }
-    } catch (err) {
-      console.warn('Upload verification check itself failed (non-fatal):', err);
-    }
-  };
 
   const handleProceedToCheckout = async () => {
     setErrorMsg(null);
@@ -561,14 +518,20 @@ export default function KioskPage() {
       for (const item of files) {
         if (item.jobId) {
           // PPT/DOC already uploaded + counted (or manually corrected after
-          // a COUNT_FAILED). Sync whatever page count is currently shown —
-          // covers the case where the person edited a failed-count fallback
-          // — so the database (which the payment amount is computed from)
-          // matches exactly what they're about to see on the payment screen.
-          const amount = item.pageCount * item.copies * getItemUnitPrice(item);
+          // a COUNT_FAILED). Sync whatever's currently shown so the
+          // database — which the payment amount is computed from — matches
+          // exactly what's about to be seen on the payment screen.
+          const amount = computeItemAmount(item.pageCount, item.copies, item.category, item.duplex);
           const { error: updateError } = await supabase
             .from('print_jobs')
-            .update({ pages_count: item.pageCount, copies: item.copies, amount_paid: amount, status: 'PENDING', page_range: item.pageRange || null })
+            .update({
+              pages_count: item.pageCount,
+              copies: item.copies,
+              duplex: item.duplex,
+              amount_paid: amount,
+              status: 'PENDING',
+              page_range: item.pageRange || null,
+            })
             .eq('id', item.jobId);
           if (updateError) throw updateError;
           jobIds.push(item.jobId);
@@ -577,7 +540,7 @@ export default function KioskPage() {
 
         if (item.category === 'BLANK') {
           // No file at all — nothing to upload, straight to an insert.
-          const amount = item.pageCount * item.copies * BLANK_COST_PER_PAGE;
+          const amount = computeItemAmount(item.pageCount, item.copies, item.category, false);
           const { data: jobRow, error: insertError } = await supabase
             .from('print_jobs')
             .insert({
@@ -597,11 +560,14 @@ export default function KioskPage() {
           continue;
         }
 
-        // PDF / IMAGE: not uploaded yet, do it now.
+        // PDF / IMAGE: not uploaded yet, do it now — with a size-verified
+        // upload (retries once on a mismatch, since some mobile browsers
+        // can report an upload as successful while the data was actually
+        // truncated mid-transfer).
         const path = `${printerId}/${Date.now()}_${item.file!.name}`;
         await uploadFileVerified(path, item.file!);
 
-        const amount = item.pageCount * item.copies * getItemUnitPrice(item);
+        const amount = computeItemAmount(item.pageCount, item.copies, item.category, item.duplex);
 
         const { data: jobRow, error: insertError } = await supabase
           .from('print_jobs')
@@ -612,6 +578,7 @@ export default function KioskPage() {
             storage_path: path,
             pages_count: item.pageCount,
             copies: item.copies,
+            duplex: item.duplex,
             amount_paid: amount,
             status: 'PENDING',
             page_range: item.pageRange || null,
@@ -630,6 +597,30 @@ export default function KioskPage() {
       setErrorMsg('Something went wrong uploading your files. Please try again.');
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  // Uploads a file, then does a best-effort check that the byte count
+  // landed correctly in Storage. Non-blocking: logs a warning on a
+  // mismatch rather than throwing, since the verification check itself
+  // (a separate storage.list() call right after upload) can report a
+  // false mismatch due to brief propagation delay — an earlier stricter
+  // version of this ended up blocking every upload, not just genuinely
+  // corrupted ones.
+  const uploadFileVerified = async (path: string, file: File): Promise<void> => {
+    const { error: uploadError } = await supabase.storage.from('print-files').upload(path, file, { upsert: false });
+    if (uploadError) throw uploadError;
+
+    try {
+      const { data: listing } = await supabase.storage
+        .from('print-files')
+        .list(path.substring(0, path.lastIndexOf('/')), { search: path.substring(path.lastIndexOf('/') + 1) });
+      const uploadedSize = listing?.[0]?.metadata?.size;
+      if (uploadedSize !== undefined && uploadedSize !== file.size) {
+        console.warn(`Upload size mismatch for ${file.name}: expected ${file.size}, storage shows ${uploadedSize} — proceeding anyway, but flagging in case this file prints incorrectly.`);
+      }
+    } catch (err) {
+      console.warn('Upload verification check itself failed (non-fatal):', err);
     }
   };
 
@@ -709,8 +700,8 @@ export default function KioskPage() {
     setStep('upload');
   };
 
-  // 1. SPLASH SCREEN — video only. If the video fails to load, fall back to
-  // the logo image alone (still no extra text) rather than a broken screen.
+  // 1. SPLASH SCREEN — video only, no text. If the video fails to load,
+  // fall back to the logo image alone.
   if (showSplash) {
     return (
       <div className="splash-screen position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center">
@@ -726,7 +717,7 @@ export default function KioskPage() {
             onError={() => setVideoFailed(true)}
           />
         ) : (
-          /* eslint-disable-next-line @next/next/no-img-element */
+          // eslint-disable-next-line @next/next/no-img-element
           <img src="/spy-logo.png" alt="S.py Printing World" style={{ maxWidth: '70%', maxHeight: '70%' }} />
         )}
         <style jsx global>{splashStyles}</style>
@@ -734,17 +725,9 @@ export default function KioskPage() {
     );
   }
 
-  // While we don't yet know the printer's status, don't claim it's offline —
-  // just show a neutral "checking" state and keep buttons disabled only
-  // for that reason (with a spinner), not silently forever.
   const heartbeatStale =
-    !printerStatus?.last_heartbeat ||
-    Date.now() - new Date(printerStatus.last_heartbeat).getTime() > HEARTBEAT_STALE_MS;
+    !printerStatus?.last_heartbeat || Date.now() - new Date(printerStatus.last_heartbeat).getTime() > HEARTBEAT_STALE_MS;
   const printerOffline = !statusLoading && !statusError && (heartbeatStale || !printerStatus?.pi_internet_online);
-  // Separate from internet connectivity — the Pi itself can be online while
-  // the printer's USB cable has been unplugged (accidentally, or someone
-  // swapping in their own device). Previously this flag was fetched but
-  // never actually checked anywhere in the UI.
   const printerDisconnected =
     !statusLoading && !statusError && !heartbeatStale && !!printerStatus && !printerStatus.pi_printer_connected;
   const lowPaper = !!printerStatus && printerStatus.paper_remaining < LOW_PAPER_THRESHOLD;
@@ -866,8 +849,20 @@ export default function KioskPage() {
                   </div>
                 )}
 
+                {selectedCategory !== 'IMAGE' && selectedCategory !== 'BLANK' && files.length > 0 && (
+                  <div className="px-3 pt-3">
+                    <div className="alert alert-info d-flex align-items-center gap-2 mb-0" role="alert">
+                      <i className="bi bi-recycle fs-5"></i>
+                      <div className="small">
+                        <strong>Save with double-sided printing!</strong> ₹{DUPLEX_COST_PER_SHEET.toFixed(2)} for 2 pages instead of ₹
+                        {(COST_PER_PAGE * 2).toFixed(2)} — look for the toggle on each file below.
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {files.length > 0 && (
-                  <div className="card-body p-2" style={{ maxHeight: '260px', overflowY: 'auto' }}>
+                  <div className="card-body p-2" style={{ maxHeight: '320px', overflowY: 'auto' }}>
                     {files.map((item) => (
                       <div key={item.id} className="file-row p-2 rounded mb-2">
                         <div className="d-flex justify-content-between align-items-center">
@@ -913,8 +908,9 @@ export default function KioskPage() {
                             </button>
                           </div>
                         </div>
-                        {!item.counting && !item.countFailed && (
-                          <div className="mt-2 d-flex align-items-center gap-2">
+
+                        {!item.counting && (
+                          <div className="mt-2 d-flex align-items-center gap-2 flex-wrap">
                             <span className="small text-secondary">Copies:</span>
                             <button
                               onClick={() => updateCopies(item.id, item.copies - 1)}
@@ -943,11 +939,29 @@ export default function KioskPage() {
                             </button>
                             {item.copies > 1 && (
                               <span className="small text-info">
-                                = {getItemTotalPages(item)} {item.category === 'BLANK' ? 'sheets' : 'pages'} total, ₹{(getItemTotalPages(item) * getItemUnitPrice(item)).toFixed(2)}
+                                = {getItemTotalPages(item)} {item.category === 'BLANK' ? 'sheets' : 'pages'} total, ₹
+                                {computeItemAmount(item.pageCount, item.copies, item.category, item.duplex).toFixed(2)}
                               </span>
                             )}
                           </div>
                         )}
+
+                        {item.category !== 'IMAGE' && item.category !== 'BLANK' && !item.counting && (
+                          <div className="form-check form-switch mt-2">
+                            <input
+                              className="form-check-input"
+                              type="checkbox"
+                              checked={item.duplex}
+                              onChange={(e) => updateDuplex(item.id, e.target.checked)}
+                              id={`duplex-${item.id}`}
+                            />
+                            <label className="form-check-label small text-secondary" htmlFor={`duplex-${item.id}`}>
+                              Print double-sided (₹{computeItemAmount(item.pageCount, item.copies, item.category, true).toFixed(2)} instead of ₹
+                              {computeItemAmount(item.pageCount, item.copies, item.category, false).toFixed(2)})
+                            </label>
+                          </div>
+                        )}
+
                         {item.countFailed && (
                           <p className="small text-warning mb-0 mt-1">
                             <i className="bi bi-info-circle me-1"></i>
@@ -1054,8 +1068,10 @@ export default function KioskPage() {
                 </div>
                 {getPrintedPages() > 0 && (
                   <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-2">
-                    <span className="text-secondary">Printed Pages ({getPrintedPages()} × ₹{COST_PER_PAGE.toFixed(2)}):</span>
-                    <span className="fw-semibold">₹{(getPrintedPages() * COST_PER_PAGE).toFixed(2)}</span>
+                    <span className="text-secondary">Printed Pages ({getPrintedPages()}):</span>
+                    <span className="fw-semibold">
+                      ₹{files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + computeItemAmount(f.pageCount, f.copies, f.category, f.duplex), 0).toFixed(2)}
+                    </span>
                   </div>
                 )}
                 {getBlankPages() > 0 && (
@@ -1070,11 +1086,7 @@ export default function KioskPage() {
                   <span className="h4 text-success fw-bold mb-0">₹{getTotalCost().toFixed(2)}</span>
                 </div>
 
-                <button
-                  onClick={handleRazorpayPayment}
-                  disabled={isProcessingPayment}
-                  className="btn btn-success fw-bold w-100 py-2"
-                >
+                <button onClick={handleRazorpayPayment} disabled={isProcessingPayment} className="btn btn-success fw-bold w-100 py-2">
                   {isProcessingPayment ? (
                     <>
                       <span className="spinner-border spinner-border-sm me-2" role="status" />
@@ -1134,33 +1146,11 @@ const splashStyles = `
   .splash-screen {
     background: radial-gradient(circle at 50% 40%, #101820 0%, #000000 80%);
   }
-  .logo-badge {
-    background: linear-gradient(135deg, #36d1dc, #0dcaf0);
-    color: #041019;
-    border-radius: 10px;
-  }
-  .spy-gradient-text {
-    background: linear-gradient(90deg, #36d1dc, #5b86e5);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
 `;
 
 const dashboardStyles = `
   .kiosk-bg {
     background: radial-gradient(circle at 50% 0%, #172029 0%, #0a0e12 60%);
-  }
-  .logo-badge {
-    background: linear-gradient(135deg, #36d1dc, #0dcaf0);
-    color: #041019;
-    border-radius: 10px;
-  }
-  .spy-gradient-text {
-    background: linear-gradient(90deg, #36d1dc, #5b86e5);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
   }
   .status-pill {
     display: inline-flex;

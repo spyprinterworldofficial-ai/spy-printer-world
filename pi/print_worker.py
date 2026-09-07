@@ -4,14 +4,23 @@ S.py Printing World — Raspberry Pi print worker.
 Runs continuously. Each cycle it:
   1. Sends a heartbeat (checks internet + printer reachability, updates the
      `printers` row so the kiosk website's status indicator stays accurate).
-  2. Looks for a COUNTING job (a PPT/DOC someone just selected, waiting for
+     Self-heals wifi if it can't actually reach Supabase for a while, even
+     if a generic internet check looks fine.
+  2. Keeps LibreOffice "warm" in the background so nobody's PPT/DOC pays a
+     ~20s cold-start penalty just for being the first one processed in a
+     while.
+  3. Looks for a COUNTING job (a PPT/DOC someone just selected, waiting for
      its real page count) and, if found, converts it and writes back the
      exact page count + price. This only needs internet, not the physical
      printer, so it still runs even if the USB cable is unplugged.
-  3. Looks for the oldest PAID job and, if the physical printer is reachable,
-     downloads, converts if needed, and prints it.
-  4. Marks jobs COMPLETED/FAILED/COUNT_FAILED as appropriate and updates
-     paper/cartridge counters.
+  4. Looks for the oldest PAID job and, if the physical printer is
+     reachable, downloads/generates, converts if needed, extracts a page
+     range if one was requested, and prints it — waiting for the printer to
+     actually finish before considering the job done, so a multi-file order
+     can't have two jobs racing on the same physical printer.
+  5. Marks jobs COMPLETED/FAILED/COUNT_FAILED as appropriate and updates
+     paper/cartridge counters (duplex-aware: paper tracks physical sheets,
+     cartridge/toner tracks logical pages printed either way).
 
 Run this directly for testing, or install it as a systemd service (see
 spy-print-worker.service in this same folder) so it survives reboots and
@@ -19,6 +28,7 @@ restarts automatically if it crashes.
 """
 
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -33,21 +43,41 @@ from reportlab.lib.pagesizes import A4
 
 load_dotenv()
 
+# Critical safety net: without this, a network call that never gets a
+# reply (a routing "black hole" — packets go out, nothing ever comes back,
+# no explicit rejection) can hang a socket-level operation forever. That's
+# different from a normal connection failure, which raises promptly and
+# gets caught by our except blocks — a true hang bypasses error handling
+# entirely, since there's never an exception to catch. This showed up as
+# the worker going completely silent after certain reboots: not logging
+# errors, not logging heartbeats, just frozen mid-call. Setting a global
+# socket timeout means EVERY blocking network operation in this process
+# is guaranteed to eventually raise instead of hanging indefinitely, so
+# our retry/self-heal logic always gets a chance to run.
+socket.setdefaulttimeout(15)
+
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 PRINTER_ID = os.environ["PRINTER_ID"]
 CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
-# Must match COST_PER_PAGE in the website's page.tsx — this is what actually
-# determines the charge now, server-side, not the browser.
-COST_PER_PAGE = int(os.environ.get("COST_PER_PAGE", "4"))
-
-last_libreoffice_activity = 0.0
-LIBREOFFICE_KEEPWARM_INTERVAL = 25  # seconds — shorter than the ~60-70s "warm" window we measured
+# Must match COST_PER_PAGE / DUPLEX_COST_PER_SHEET in the website's
+# page.tsx (display) and create-razorpay-order/route.ts (actual charge) —
+# three separate places since each runs in a different environment.
+COST_PER_PAGE = float(os.environ.get("COST_PER_PAGE", "3"))
+DUPLEX_COST_PER_SHEET = float(os.environ.get("DUPLEX_COST_PER_SHEET", "4.5"))
 
 STORAGE_BUCKET = "print-files"
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+# Tracks when LibreOffice was last actually used, so main_loop can
+# periodically re-warm it in the background during idle time — a one-time
+# warmup at service startup wasn't enough, since LibreOffice's "warm"
+# state was measured to last well under 60-70s on this hardware.
+last_libreoffice_activity = 0.0
+LIBREOFFICE_KEEPWARM_INTERVAL = 25  # seconds — shorter than the measured "warm" window
 
 
 def check_internet() -> bool:
@@ -74,9 +104,9 @@ def send_heartbeat():
     printer_ok = check_printer_connected() if online else False
     # Tracked separately from `online` (a generic Google ping) because the
     # two can genuinely disagree — e.g. general internet works fine while
-    # Supabase specifically is unreachable (stale DNS entry, routing quirk,
-    # etc). What actually matters for the whole system is whether we can
-    # reach Supabase, so self-healing below is gated on this, not on the
+    # Supabase specifically is unreachable (stale DNS entry, routing
+    # quirk). What actually matters for the whole system is whether we can
+    # reach Supabase, so self-healing below is gated on this, not the
     # generic ping.
     heartbeat_write_ok = False
     try:
@@ -89,6 +119,24 @@ def send_heartbeat():
     except Exception as e:
         print(f"[heartbeat] failed to update: {e}")
     return online, printer_ok, heartbeat_write_ok
+
+
+def try_reconnect_wifi():
+    """Runs `nmcli device connect wlan0` to nudge wifi back to life.
+    Requires passwordless sudo for this specific command. Used as a
+    self-healing fallback for a known Pi quirk where wifi sometimes
+    doesn't auto-connect cleanly after a fresh power cycle — a manual
+    `nmcli device connect wlan0` reliably fixes it when this happens, so
+    the worker does that automatically instead of needing someone to SSH
+    in and run it by hand."""
+    try:
+        result = subprocess.run(
+            ["sudo", "nmcli", "device", "connect", "wlan0"],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(f"[wifi-heal] reconnect attempt: {result.stdout.strip() or result.stderr.strip()}")
+    except Exception as e:
+        print(f"[wifi-heal] reconnect attempt failed: {e}")
 
 
 def fetch_next_job():
@@ -130,29 +178,14 @@ def download_job_file(storage_path: str, dest_path: Path):
     data = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
     dest_path.write_bytes(data)
 
-def warm_up_libreoffice():
-    global last_libreoffice_activity
-    print("[keepwarm] warming up LibreOffice...")
-    start = time.time()
-    try:
-        subprocess.run(
-            ["libreoffice", "--headless", "--terminate_after_init"],
-            timeout=40, capture_output=True,
-        )
-        print(f"[keepwarm] LibreOffice warmed up in {time.time() - start:.1f}s")
-    except Exception as e:
-        print(f"[keepwarm] LibreOffice warmup failed (non-fatal): {e}")
-    last_libreoffice_activity = time.time()
-
 
 def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
+    """Uses headless LibreOffice to convert PPT/DOC files to PDF. Used both
+    for actual printing and for exact page counting — the same conversion
+    either way, so the count someone pays for and the pages that actually
+    come out of the printer are always the same source of truth."""
     global last_libreoffice_activity
     last_libreoffice_activity = time.time()
-    """Uses headless LibreOffice to convert PPT/DOC files to PDF. Used both
-    for actual printing and for exact page counting (below) — the same
-    conversion either way, so the count the person pays for and the pages
-    that actually come out of the printer are always the same source of
-    truth."""
     subprocess.run(
         [
             "libreoffice", "--headless", "--norestore",
@@ -166,7 +199,6 @@ def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
     return pdf_path
 
 
-
 def get_pdf_page_count(pdf_path: Path) -> int:
     """Requires poppler-utils (`sudo apt install poppler-utils`) for the
     `pdfinfo` command."""
@@ -177,6 +209,21 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         if line.startswith("Pages:"):
             return int(line.split(":", 1)[1].strip())
     raise RuntimeError("Could not find a 'Pages:' line in pdfinfo output")
+
+
+def upload_converted_pdf(pdf_path: Path, original_storage_path: str) -> str:
+    """Uploads the PDF produced during counting back to Storage, so
+    printing later reuses this exact file instead of converting again —
+    guarantees the pages someone paid for are exactly the pages that get
+    printed, not a second, possibly slightly different, conversion of the
+    same source file (LibreOffice's conversion isn't perfectly
+    deterministic in every case)."""
+    converted_path = f"{original_storage_path}.converted.pdf"
+    with open(pdf_path, "rb") as f:
+        supabase.storage.from_(STORAGE_BUCKET).upload(
+            converted_path, f, file_options={"upsert": "true"}
+        )
+    return converted_path
 
 
 def extract_page_range(source_pdf: Path, page_range: str, workdir: Path) -> Path:
@@ -207,11 +254,29 @@ def generate_blank_pdf(num_pages: int, output_path: Path):
     c.save()
 
 
-def print_file(pdf_or_image_path: Path, copies: int):
-    subprocess.run(
-        ["lp", "-d", CUPS_PRINTER_NAME, "-n", str(max(1, copies)), str(pdf_or_image_path)],
-        check=True, timeout=60,
-    )
+def compute_amount(pages: int, copies: int, duplex: bool) -> float:
+    """Shared pricing formula — must stay identical to computeItemAmount()
+    in the website's page.tsx and computeJobAmount() in
+    create-razorpay-order/route.ts. A duplex job prices in pairs: one
+    discounted sheet covers 2 pages. A leftover odd page can't be
+    duplexed (nothing to print on its back), so it's charged at the plain
+    single-side rate. (Blank-page orders are priced by the website/route
+    directly and never reach this function, since the Pi only ever counts
+    real PPT/DOC files.)"""
+    n = pages * copies
+    if duplex:
+        pairs = n // 2
+        leftover = n % 2
+        return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE
+    return n * COST_PER_PAGE
+
+
+def print_file(pdf_or_image_path: Path, copies: int, duplex: bool = False):
+    cmd = ["lp", "-d", CUPS_PRINTER_NAME, "-n", str(max(1, copies))]
+    if duplex:
+        cmd += ["-o", "Duplex=DuplexNoTumble"]
+    cmd.append(str(pdf_or_image_path))
+    subprocess.run(cmd, check=True, timeout=60)
 
 
 def wait_until_printer_idle(timeout_seconds: int = 120):
@@ -242,16 +307,27 @@ def wait_until_printer_idle(timeout_seconds: int = 120):
     return False
 
 
-def upload_converted_pdf(pdf_path: Path, original_storage_path: str) -> str:
-    """Uploads the PDF produced during counting back to Storage, so printing
-    later can reuse this exact file instead of converting again — see the
-    comment on convert_to_pdf for why that determinism matters."""
-    converted_path = f"{original_storage_path}.converted.pdf"
-    with open(pdf_path, "rb") as f:
-        supabase.storage.from_(STORAGE_BUCKET).upload(
-            converted_path, f, file_options={"upsert": "true"}
+def warm_up_libreoffice():
+    """LibreOffice's first headless invocation after being idle pays a
+    one-time ~20s startup cost (profile init, font loading) completely
+    separate from actual conversion time — every invocation after that,
+    while it stays "warm", is near-instant. Called once at service
+    startup and then periodically from main_loop during idle time, so
+    nobody's real file has to pay this cost themselves."""
+    global last_libreoffice_activity
+    print("[keepwarm] warming up LibreOffice...")
+    start = time.time()
+    try:
+        subprocess.run(
+            ["libreoffice", "--headless", "--terminate_after_init"],
+            timeout=40, capture_output=True,
         )
-    return converted_path
+        print(f"[keepwarm] LibreOffice warmed up in {time.time() - start:.1f}s")
+    except Exception as e:
+        # Non-fatal — worst case, the first real job just pays the cold
+        # start cost itself, same as before this fix existed.
+        print(f"[keepwarm] LibreOffice warmup failed (non-fatal): {e}")
+    last_libreoffice_activity = time.time()
 
 
 def process_counting_job(job: dict):
@@ -259,9 +335,7 @@ def process_counting_job(job: dict):
     real pages_count + amount_paid back and flips the job to PENDING
     (ready for checkout). The converted PDF is uploaded back to Storage
     (converted_pdf_path) so that printing later reuses this exact file
-    instead of re-converting — guaranteeing the pages someone paid for are
-    exactly the pages that get printed, not a second, possibly slightly
-    different, conversion of the same source file.
+    instead of re-converting.
 
     Every write here is guarded with .eq('status', 'COUNTING') so that if
     the website deleted this job in the meantime (person removed the file
@@ -271,6 +345,7 @@ def process_counting_job(job: dict):
     file_name = job["file_name"]
     storage_path = job["storage_path"]
     copies = job.get("copies", 1) or 1
+    duplex = job.get("duplex", False)
 
     print(f"[count {job_id}] counting pages for {file_name}")
 
@@ -282,7 +357,7 @@ def process_counting_job(job: dict):
         pages = get_pdf_page_count(pdf_path)
         converted_pdf_path = upload_converted_pdf(pdf_path, storage_path)
 
-    amount = pages * copies * COST_PER_PAGE
+    amount = compute_amount(pages, copies, duplex)
     supabase.table("print_jobs").update({
         "pages_count": pages,
         "amount_paid": amount,
@@ -299,11 +374,12 @@ def process_job(job: dict):
     file_type = job["file_type"]
     converted_pdf_path = job.get("converted_pdf_path")
     page_range = job.get("page_range")
+    duplex = job.get("duplex", False)
     pages_count = job["pages_count"]
     copies = job.get("copies", 1) or 1
 
     print(f"[job {job_id}] picked up: {file_name} ({file_type}, {pages_count}p x{copies}"
-          f"{', pages ' + page_range if page_range else ''})")
+          f"{', duplex' if duplex else ''}{', pages ' + page_range if page_range else ''})")
     set_job_status(job_id, "PRINTING")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -316,8 +392,7 @@ def process_job(job: dict):
         elif file_type in CONVERTIBLE_CATEGORIES and converted_pdf_path:
             # Reuse the exact PDF that was already produced and counted
             # during the counting phase, instead of converting the source
-            # file again — guarantees what gets printed matches exactly
-            # what was counted and charged for.
+            # file again.
             print(f"[job {job_id}] reusing already-converted PDF from counting phase")
             print_target = workdir / "converted.pdf"
             download_job_file(converted_pdf_path, print_target)
@@ -333,29 +408,28 @@ def process_job(job: dict):
                 print_target = convert_to_pdf(local_path, workdir)
 
         # Applied last, after whichever PDF we're going to print has been
-        # resolved above (original, converted, or reused-converted) — this
-        # is what makes sure only the paid-for pages ever reach the
-        # printer, regardless of file type or conversion path.
+        # resolved above — this is what makes sure only the paid-for pages
+        # ever reach the printer, regardless of file type or conversion path.
         if page_range and file_type not in ('IMAGE', 'BLANK'):
             print(f"[job {job_id}] extracting pages {page_range} before printing")
             print_target = extract_page_range(print_target, page_range, workdir)
 
         print(f"[job {job_id}] sending to printer '{CUPS_PRINTER_NAME}'...")
-        print_file(print_target, copies)
+        print_file(print_target, copies, duplex)
 
     print(f"[job {job_id}] waiting for printer to finish before considering this job done...")
     wait_until_printer_idle()
 
-    # Deduct paper. Never go negative — floor at 0 so the low-paper warning
-    # on the kiosk still shows correctly rather than a nonsensical value.
-    # cartridge_page_count tracks usage since the last cartridge replacement
-    # — this is what the admin app's duty-cycle warning (10,000 pages) reads.
-    # Lifetime total (for "total pages printed") is computed on-demand by
-    # the admin backend from completed print_jobs, so it isn't duplicated
-    # here — only cartridge_page_count needs incrementing.
+    # Deduct paper/toner. Duplex halves the physical sheets used for the
+    # same number of printed pages (paper tracks sheets), but toner lands
+    # on both sides either way (cartridge tracks logical pages,
+    # unaffected by duplex). Never go negative on paper — floor at 0 so
+    # the low-paper warning on the kiosk still shows correctly.
+    n = pages_count * copies
+    sheets_used = -(-n // 2) if duplex else n  # ceiling division when duplex
     printer_row = supabase.table("printers").select("paper_remaining, cartridge_page_count").eq("id", PRINTER_ID).single().execute().data
-    new_remaining = max(0, printer_row["paper_remaining"] - pages_count * copies)
-    new_cartridge_count = (printer_row.get("cartridge_page_count") or 0) + pages_count * copies
+    new_remaining = max(0, printer_row["paper_remaining"] - sheets_used)
+    new_cartridge_count = (printer_row.get("cartridge_page_count") or 0) + n
     supabase.table("printers").update({
         "paper_remaining": new_remaining,
         "cartridge_page_count": new_cartridge_count,
@@ -374,43 +448,27 @@ def process_job(job: dict):
             print(f"[job {job_id}] could not clean up converted PDF (non-fatal): {e}")
 
 
-def try_reconnect_wifi():
-    """Runs `nmcli device connect wlan0` to nudge wifi back to life.
-    Requires passwordless sudo for this specific command to be configured
-    for this user (already the case here, since other `sudo` commands in
-    this setup guide run non-interactively). Used as a self-healing
-    fallback for a known Pi quirk where wifi sometimes doesn't
-    auto-connect cleanly after a fresh power cycle — a manual
-    `nmcli device connect wlan0` reliably fixes it when this happens, so
-    the worker does that automatically instead of needing someone to SSH
-    in and run it by hand."""
-    try:
-        result = subprocess.run(
-            ["sudo", "nmcli", "device", "connect", "wlan0"],
-            capture_output=True, text=True, timeout=30,
-        )
-        print(f"[wifi-heal] reconnect attempt: {result.stdout.strip() or result.stderr.strip()}")
-    except Exception as e:
-        print(f"[wifi-heal] reconnect attempt failed: {e}")
-
-
 def main_loop():
     print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}'")
     consecutive_offline_cycles = 0
-    # Only nudge wifi every ~60s of continuous offline-ness (12 cycles at
-    # the default 5s poll interval), not every single cycle — avoids
-    # hammering nmcli uselessly while giving it real chances to recover.
+    # Only nudge wifi every ~60s of continuous "can't reach Supabase", not
+    # every single cycle — avoids hammering nmcli uselessly while giving
+    # it real chances to recover.
     RECONNECT_EVERY_N_CYCLES = max(1, round(60 / POLL_INTERVAL_SECONDS))
 
     while True:
         try:
             online, printer_ok, heartbeat_write_ok = send_heartbeat()
+
+            if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
+                warm_up_libreoffice()
+
             if not heartbeat_write_ok:
-                # Gated on whether we could actually reach Supabase, not on
+                # Gated on whether we could actually reach Supabase, not
                 # the generic `online` ping — those two can genuinely
                 # disagree (general internet fine, Supabase specifically
-                # unreachable due to a stale DNS entry or similar), and
-                # what actually matters here is Supabase reachability.
+                # unreachable), and what actually matters is Supabase
+                # reachability.
                 consecutive_offline_cycles += 1
                 print(f"[loop] can't reach Supabase — skipping this cycle (failing for {consecutive_offline_cycles} cycles, general internet check: {online})")
                 if consecutive_offline_cycles % RECONNECT_EVERY_N_CYCLES == 0:
@@ -455,6 +513,5 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
-        warm_up_libreoffice()
+    warm_up_libreoffice()
     main_loop()
