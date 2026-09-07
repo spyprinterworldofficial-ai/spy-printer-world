@@ -2,12 +2,40 @@ import { NextResponse } from 'next/server';
 import Razorpay from 'razorpay';
 import { createClient } from '@supabase/supabase-js';
 
-// Service role client so this route can tag print_jobs with the order id
-// regardless of RLS (the anon key only has INSERT rights on PENDING rows).
+// Server-only client — service role key bypasses RLS, which this route
+// needs to read/update any job regardless of who created it. Never expose
+// this key or this client to the browser.
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+// Server-side pricing config — NOT NEXT_PUBLIC, since this route doesn't
+// need it baked into the browser bundle. Must be kept in sync with the
+// NEXT_PUBLIC_* equivalents in page.tsx (what's displayed) and the
+// matching vars in the Pi worker's .env (used right when a PPT/DOC
+// finishes counting) — three separate places since each runs in a
+// different environment, but all read from an actual env var instead of a
+// hardcoded literal, so a config change can't silently fail to apply.
+const COST_PER_PAGE = Number(process.env.COST_PER_PAGE) || 3;
+const BLANK_COST_PER_PAGE = Number(process.env.BLANK_COST_PER_PAGE) || 1.5;
+const DUPLEX_COST_PER_SHEET = Number(process.env.DUPLEX_COST_PER_SHEET) || 4.5;
+
+// Shared formula — must stay byte-for-byte identical to computeItemAmount()
+// in page.tsx and compute_amount() in the Pi's print_worker.py. A duplex
+// job prices in pairs: one discounted sheet covers 2 pages. A leftover odd
+// page can't be duplexed (nothing to print on its back), so it's charged
+// at the plain single-side rate.
+function computeJobAmount(pagesCount: number, copies: number, fileType: string, duplex: boolean): number {
+  const n = pagesCount * copies;
+  if (fileType === 'BLANK') return n * BLANK_COST_PER_PAGE;
+  if (duplex) {
+    const pairs = Math.floor(n / 2);
+    const leftover = n % 2;
+    return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE;
+  }
+  return n * COST_PER_PAGE;
+}
 
 export async function POST(req: Request) {
   try {
@@ -17,14 +45,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing job_ids' }, { status: 400 });
     }
 
-    // The charge is computed here, from the database, not from whatever
-    // the browser sends — a client could otherwise edit page counts /
-    // amounts in JS before this call and pay less than the real total.
-    // Only PENDING rows are trusted as "final" (COUNTING/COUNT_FAILED rows
-    // haven't settled on a real page count yet).
+    // The charge is computed here, from the database, never trusting
+    // whatever the browser sends — a client could otherwise edit page
+    // counts / amounts in JS before this call and pay less than the real
+    // total. Only PENDING rows are trusted as "final" (COUNTING/
+    // COUNT_FAILED rows haven't settled on a real page count yet).
     const { data: jobs, error: fetchError } = await supabaseAdmin
       .from('print_jobs')
-      .select('id, pages_count, copies, status, file_type')
+      .select('id, pages_count, copies, status, file_type, duplex')
       .in('id', job_ids);
     if (fetchError) throw fetchError;
 
@@ -36,20 +64,10 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `Job ${notReady.id} is not ready for payment (status: ${notReady.status})` }, { status: 400 });
     }
 
-    // Server-side, not NEXT_PUBLIC — this route doesn't need it baked into
-    // the browser bundle. Must be kept in sync with NEXT_PUBLIC_COST_PER_PAGE
-    // / NEXT_PUBLIC_BLANK_COST_PER_PAGE (frontend display) and the matching
-    // vars in the Pi worker's .env — several separate places since each
-    // runs in a different environment, but all read from an actual env var
-    // instead of a hardcoded number, so a config change can't silently
-    // fail to apply like it did before.
-    const COST_PER_PAGE = Number(process.env.COST_PER_PAGE) || 4;
-    const BLANK_COST_PER_PAGE = Number(process.env.BLANK_COST_PER_PAGE) || 1.5;
-
-    const amountRupees = jobs.reduce((sum, j) => {
-      const rate = j.file_type === 'BLANK' ? BLANK_COST_PER_PAGE : COST_PER_PAGE;
-      return sum + j.pages_count * (j.copies || 1) * rate;
-    }, 0);
+    const amountRupees = jobs.reduce(
+      (sum, j) => sum + computeJobAmount(j.pages_count, j.copies || 1, j.file_type, !!j.duplex),
+      0
+    );
 
     if (amountRupees <= 0) {
       return NextResponse.json({ error: 'Computed amount is zero' }, { status: 400 });
@@ -70,12 +88,12 @@ export async function POST(req: Request) {
     // This is what lets the webhook (which only knows the order id) find
     // and update the right rows later, even if the browser never calls
     // the verify endpoint.
-    const { error } = await supabaseAdmin
+    const { error: tagError } = await supabaseAdmin
       .from('print_jobs')
       .update({ razorpay_order_id: order.id })
       .in('id', job_ids)
       .eq('status', 'PENDING');
-    if (error) throw error;
+    if (tagError) throw tagError;
 
     return NextResponse.json({ order_id: order.id, amount: order.amount });
   } catch (err) {
