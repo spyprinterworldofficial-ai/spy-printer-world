@@ -61,11 +61,14 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 PRINTER_ID = os.environ["PRINTER_ID"]
 CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
-# Must match COST_PER_PAGE / DUPLEX_COST_PER_SHEET in the website's
-# page.tsx (display) and create-razorpay-order/route.ts (actual charge) —
-# three separate places since each runs in a different environment.
-COST_PER_PAGE = float(os.environ.get("COST_PER_PAGE", "3"))
-DUPLEX_COST_PER_SHEET = float(os.environ.get("DUPLEX_COST_PER_SHEET", "4.5"))
+# Pricing now lives per-printer in the `printers` table, not env vars —
+# different printers/institutes can charge different rates. Fetched fresh
+# each time process_counting_job needs it (see fetch_this_printer_pricing
+# below), so a price change in the database takes effect on the very next
+# job, no restart needed. These are only the fallback if the DB row
+# somehow lacks the columns.
+FALLBACK_COST_PER_PAGE = 5.0
+FALLBACK_DUPLEX_COST_PER_SHEET = 4.5
 
 STORAGE_BUCKET = "print-files"
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
@@ -254,7 +257,23 @@ def generate_blank_pdf(num_pages: int, output_path: Path):
     c.save()
 
 
-def compute_amount(pages: int, copies: int, duplex: bool) -> float:
+def fetch_this_printer_pricing() -> tuple[float, float]:
+    """Reads THIS printer's own cost_per_page/duplex_cost_per_sheet from
+    its row in the `printers` table. Fetched fresh (not cached) so a price
+    change made anywhere — Supabase directly, or eventually the admin app
+    — takes effect on the very next job, no restart needed."""
+    try:
+        row = supabase.table("printers").select("cost_per_page, duplex_cost_per_sheet").eq("id", PRINTER_ID).single().execute().data
+        return (
+            float(row.get("cost_per_page", FALLBACK_COST_PER_PAGE)),
+            float(row.get("duplex_cost_per_sheet", FALLBACK_DUPLEX_COST_PER_SHEET)),
+        )
+    except Exception as e:
+        print(f"[pricing] failed to fetch this printer's pricing, using fallback: {e}")
+        return FALLBACK_COST_PER_PAGE, FALLBACK_DUPLEX_COST_PER_SHEET
+
+
+def compute_amount(pages: int, copies: int, duplex: bool, cost_per_page: float, duplex_cost_per_sheet: float) -> float:
     """Shared pricing formula — must stay identical to computeItemAmount()
     in the website's page.tsx and computeJobAmount() in
     create-razorpay-order/route.ts. A duplex job prices in pairs: one
@@ -267,8 +286,8 @@ def compute_amount(pages: int, copies: int, duplex: bool) -> float:
     if duplex:
         pairs = n // 2
         leftover = n % 2
-        return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE
-    return n * COST_PER_PAGE
+        return pairs * duplex_cost_per_sheet + leftover * cost_per_page
+    return n * cost_per_page
 
 
 def print_file(pdf_or_image_path: Path, copies: int, duplex: bool = False):
@@ -357,7 +376,8 @@ def process_counting_job(job: dict):
         pages = get_pdf_page_count(pdf_path)
         converted_pdf_path = upload_converted_pdf(pdf_path, storage_path)
 
-    amount = compute_amount(pages, copies, duplex)
+    cost_per_page, duplex_cost_per_sheet = fetch_this_printer_pricing()
+    amount = compute_amount(pages, copies, duplex, cost_per_page, duplex_cost_per_sheet)
     supabase.table("print_jobs").update({
         "pages_count": pages,
         "amount_paid": amount,

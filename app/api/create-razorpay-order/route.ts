@@ -10,31 +10,36 @@ const supabaseAdmin = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// Server-side pricing config — NOT NEXT_PUBLIC, since this route doesn't
-// need it baked into the browser bundle. Must be kept in sync with the
-// NEXT_PUBLIC_* equivalents in page.tsx (what's displayed) and the
-// matching vars in the Pi worker's .env (used right when a PPT/DOC
-// finishes counting) — three separate places since each runs in a
-// different environment, but all read from an actual env var instead of a
-// hardcoded literal, so a config change can't silently fail to apply.
-const COST_PER_PAGE = Number(process.env.COST_PER_PAGE) || 3;
-const BLANK_COST_PER_PAGE = Number(process.env.BLANK_COST_PER_PAGE) || 1.5;
-const DUPLEX_COST_PER_SHEET = Number(process.env.DUPLEX_COST_PER_SHEET) || 4.5;
+// Fallback ONLY — used if a job's printer row somehow lacks pricing
+// columns (shouldn't happen once the migration's run, but avoids a crash
+// either way). Real pricing always comes from that specific printer's own
+// row — different printers/institutes can charge different rates.
+const FALLBACK_COST_PER_PAGE = 5;
+const FALLBACK_BLANK_COST_PER_PAGE = 1.5;
+const FALLBACK_DUPLEX_COST_PER_SHEET = 4.5;
 
 // Shared formula — must stay byte-for-byte identical to computeItemAmount()
 // in page.tsx and compute_amount() in the Pi's print_worker.py. A duplex
 // job prices in pairs: one discounted sheet covers 2 pages. A leftover odd
 // page can't be duplexed (nothing to print on its back), so it's charged
 // at the plain single-side rate.
-function computeJobAmount(pagesCount: number, copies: number, fileType: string, duplex: boolean): number {
+function computeJobAmount(
+  pagesCount: number,
+  copies: number,
+  fileType: string,
+  duplex: boolean,
+  costPerPage: number,
+  duplexCostPerSheet: number,
+  blankCostPerPage: number
+): number {
   const n = pagesCount * copies;
-  if (fileType === 'BLANK') return n * BLANK_COST_PER_PAGE;
+  if (fileType === 'BLANK') return n * blankCostPerPage;
   if (duplex) {
     const pairs = Math.floor(n / 2);
     const leftover = n % 2;
-    return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE;
+    return pairs * duplexCostPerSheet + leftover * costPerPage;
   }
-  return n * COST_PER_PAGE;
+  return n * costPerPage;
 }
 
 export async function POST(req: Request) {
@@ -52,7 +57,7 @@ export async function POST(req: Request) {
     // COUNT_FAILED rows haven't settled on a real page count yet).
     const { data: jobs, error: fetchError } = await supabaseAdmin
       .from('print_jobs')
-      .select('id, pages_count, copies, status, file_type, duplex')
+      .select('id, pages_count, copies, status, file_type, duplex, printer_id')
       .in('id', job_ids);
     if (fetchError) throw fetchError;
 
@@ -64,10 +69,40 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `Job ${notReady.id} is not ready for payment (status: ${notReady.status})` }, { status: 400 });
     }
 
-    const amountRupees = jobs.reduce(
-      (sum, j) => sum + computeJobAmount(j.pages_count, j.copies || 1, j.file_type, !!j.duplex),
-      0
-    );
+    // All jobs in one order come from the same kiosk session, so they
+    // should all share the same printer_id — but fetch pricing per-job's
+    // actual printer_id anyway rather than assuming, in case that ever
+    // changes. Cache lookups so we don't re-query the same printer twice.
+    const printerPricingCache = new Map<string, { costPerPage: number; duplexCostPerSheet: number; blankCostPerPage: number }>();
+    const getPrinterPricing = async (printerId: string) => {
+      if (printerPricingCache.has(printerId)) return printerPricingCache.get(printerId)!;
+      const { data: printer } = await supabaseAdmin
+        .from('printers')
+        .select('cost_per_page, duplex_cost_per_sheet, blank_cost_per_page')
+        .eq('id', printerId)
+        .single();
+      const pricing = {
+        costPerPage: printer?.cost_per_page ?? FALLBACK_COST_PER_PAGE,
+        duplexCostPerSheet: printer?.duplex_cost_per_sheet ?? FALLBACK_DUPLEX_COST_PER_SHEET,
+        blankCostPerPage: printer?.blank_cost_per_page ?? FALLBACK_BLANK_COST_PER_PAGE,
+      };
+      printerPricingCache.set(printerId, pricing);
+      return pricing;
+    };
+
+    let amountRupees = 0;
+    for (const j of jobs) {
+      const pricing = await getPrinterPricing(j.printer_id);
+      amountRupees += computeJobAmount(
+        j.pages_count,
+        j.copies || 1,
+        j.file_type,
+        !!j.duplex,
+        pricing.costPerPage,
+        pricing.duplexCostPerSheet,
+        pricing.blankCostPerPage
+      );
+    }
 
     if (amountRupees <= 0) {
       return NextResponse.json({ error: 'Computed amount is zero' }, { status: 400 });

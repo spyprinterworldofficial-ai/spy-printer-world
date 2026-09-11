@@ -33,9 +33,14 @@ const MAX_FILE_SIZE_BYTES: Record<Category, number> = {
 // create-razorpay-order/route.ts (server-side charge) and the Pi worker's
 // .env (used when it finishes counting a PPT/DOC) — three separate places
 // since each runs in a different environment.
-const COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_COST_PER_PAGE) || 3;
-const BLANK_COST_PER_PAGE = Number(process.env.NEXT_PUBLIC_BLANK_COST_PER_PAGE) || 1.5;
-const DUPLEX_COST_PER_SHEET = Number(process.env.NEXT_PUBLIC_DUPLEX_COST_PER_SHEET) || 4.5;
+// Fallback defaults ONLY — used the brief moment before the printer's own
+// row has loaded. Once loaded, actual pricing always comes from that
+// printer's own row (see PrinterStatus below), since different printers
+///institutes can charge different rates. These are not meant to be tuned
+// per deployment anymore; edit a printer's row in the database instead.
+const FALLBACK_COST_PER_PAGE = 5;
+const FALLBACK_BLANK_COST_PER_PAGE = 1.5;
+const FALLBACK_DUPLEX_COST_PER_SHEET = 4.5;
 
 const LOW_PAPER_THRESHOLD = 10;
 // The Pi worker heartbeats every ~5s while running. If we haven't heard
@@ -54,6 +59,9 @@ interface PrinterStatus {
   pi_internet_online: boolean;
   pi_printer_connected: boolean;
   last_heartbeat: string;
+  cost_per_page: number;
+  duplex_cost_per_sheet: number;
+  blank_cost_per_page: number;
 }
 
 interface UploadedFile {
@@ -163,15 +171,28 @@ async function resolvePdfPageCount(file: File): Promise<{ pageCount: number; est
 // counting). A duplex job prices in pairs: one discounted sheet covers 2
 // pages. A leftover odd page can't be duplexed (nothing to print on its
 // back), so it's charged at the plain single-side rate.
-function computeItemAmount(pages: number, copies: number, category: Category, duplex: boolean): number {
+//
+// Pricing (costPerPage/duplexCostPerSheet/blankCostPerPage) is now always
+// passed in explicitly, read from THIS printer's own row — different
+// printers/institutes can charge different rates, so nothing here is a
+// fixed global constant anymore.
+function computeItemAmount(
+  pages: number,
+  copies: number,
+  category: Category,
+  duplex: boolean,
+  costPerPage: number,
+  duplexCostPerSheet: number,
+  blankCostPerPage: number
+): number {
   const n = pages * copies;
-  if (category === 'BLANK') return n * BLANK_COST_PER_PAGE;
+  if (category === 'BLANK') return n * blankCostPerPage;
   if (duplex) {
     const pairs = Math.floor(n / 2);
     const leftover = n % 2;
-    return pairs * DUPLEX_COST_PER_SHEET + leftover * COST_PER_PAGE;
+    return pairs * duplexCostPerSheet + leftover * costPerPage;
   }
-  return n * COST_PER_PAGE;
+  return n * costPerPage;
 }
 
 // Small self-contained control for the Blank Pages flow — a quantity
@@ -506,7 +527,7 @@ export default function KioskPage() {
   const getPrintedPages = () => files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
   const getBlankPages = () => files.filter((f) => f.category === 'BLANK').reduce((acc, f) => acc + getItemTotalPages(f), 0);
   const getTotalPages = () => getPrintedPages() + getBlankPages();
-  const getTotalCost = () => files.reduce((acc, f) => acc + computeItemAmount(f.pageCount, f.copies, f.category, f.duplex), 0);
+  const getTotalCost = () => files.reduce((acc, f) => acc + priceItem(f), 0);
   const getTotalSizeMB = () => (files.reduce((acc, f) => acc + (f.file?.size || 0), 0) / (1024 * 1024)).toFixed(2);
 
   const handleProceedToCheckout = async () => {
@@ -521,7 +542,7 @@ export default function KioskPage() {
           // a COUNT_FAILED). Sync whatever's currently shown so the
           // database — which the payment amount is computed from — matches
           // exactly what's about to be seen on the payment screen.
-          const amount = computeItemAmount(item.pageCount, item.copies, item.category, item.duplex);
+          const amount = priceItem(item);
           const { error: updateError } = await supabase
             .from('print_jobs')
             .update({
@@ -540,7 +561,7 @@ export default function KioskPage() {
 
         if (item.category === 'BLANK') {
           // No file at all — nothing to upload, straight to an insert.
-          const amount = computeItemAmount(item.pageCount, item.copies, item.category, false);
+          const amount = priceItem(item, false);
           const { data: jobRow, error: insertError } = await supabase
             .from('print_jobs')
             .insert({
@@ -567,7 +588,7 @@ export default function KioskPage() {
         const path = `${printerId}/${Date.now()}_${item.file!.name}`;
         await uploadFileVerified(path, item.file!);
 
-        const amount = computeItemAmount(item.pageCount, item.copies, item.category, item.duplex);
+        const amount = priceItem(item);
 
         const { data: jobRow, error: insertError } = await supabase
           .from('print_jobs')
@@ -735,6 +756,23 @@ export default function KioskPage() {
   const canUpload =
     !statusLoading && !statusError && !printerOffline && !printerDisconnected && !lowPaper && !printerDisabled;
 
+  // Pricing always comes from THIS printer's own row — different
+  // printers/institutes can charge different rates. Fallbacks only cover
+  // the brief moment before the row has loaded.
+  const costPerPage = printerStatus?.cost_per_page ?? FALLBACK_COST_PER_PAGE;
+  const duplexCostPerSheet = printerStatus?.duplex_cost_per_sheet ?? FALLBACK_DUPLEX_COST_PER_SHEET;
+  const blankCostPerPage = printerStatus?.blank_cost_per_page ?? FALLBACK_BLANK_COST_PER_PAGE;
+  const priceItem = (item: UploadedFile, duplexOverride?: boolean) =>
+    computeItemAmount(
+      item.pageCount,
+      item.copies,
+      item.category,
+      duplexOverride !== undefined ? duplexOverride : item.duplex,
+      costPerPage,
+      duplexCostPerSheet,
+      blankCostPerPage
+    );
+
   // 2. MAIN DASHBOARD
   return (
     <div className="kiosk-bg min-vh-100 text-light d-flex flex-column align-items-center p-3 p-md-4">
@@ -845,7 +883,7 @@ export default function KioskPage() {
 
                 {selectedCategory === 'BLANK' && (
                   <div className="card-body">
-                    <BlankPagesPicker onAdd={addBlankPages} unitPrice={BLANK_COST_PER_PAGE} />
+                    <BlankPagesPicker onAdd={addBlankPages} unitPrice={blankCostPerPage} />
                   </div>
                 )}
 
@@ -854,8 +892,8 @@ export default function KioskPage() {
                     <div className="alert alert-info d-flex align-items-center gap-2 mb-0" role="alert">
                       <i className="bi bi-recycle fs-5"></i>
                       <div className="small">
-                        <strong>Save with double-sided printing!</strong> ₹{DUPLEX_COST_PER_SHEET.toFixed(2)} for 2 pages instead of ₹
-                        {(COST_PER_PAGE * 2).toFixed(2)} — look for the toggle on each file below.
+                        <strong>Save with double-sided printing!</strong> ₹{duplexCostPerSheet.toFixed(2)} for 2 pages instead of ₹
+                        {(costPerPage * 2).toFixed(2)} — look for the toggle on each file below.
                       </div>
                     </div>
                   </div>
@@ -940,7 +978,7 @@ export default function KioskPage() {
                             {item.copies > 1 && (
                               <span className="small text-info">
                                 = {getItemTotalPages(item)} {item.category === 'BLANK' ? 'sheets' : 'pages'} total, ₹
-                                {computeItemAmount(item.pageCount, item.copies, item.category, item.duplex).toFixed(2)}
+                                {priceItem(item).toFixed(2)}
                               </span>
                             )}
                           </div>
@@ -956,8 +994,8 @@ export default function KioskPage() {
                               id={`duplex-${item.id}`}
                             />
                             <label className="form-check-label small text-secondary" htmlFor={`duplex-${item.id}`}>
-                              Print double-sided (₹{computeItemAmount(item.pageCount, item.copies, item.category, true).toFixed(2)} instead of ₹
-                              {computeItemAmount(item.pageCount, item.copies, item.category, false).toFixed(2)})
+                              Print double-sided (₹{priceItem(item, true).toFixed(2)} instead of ₹
+                              {priceItem(item, false).toFixed(2)})
                             </label>
                           </div>
                         )}
@@ -1070,14 +1108,14 @@ export default function KioskPage() {
                   <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-2">
                     <span className="text-secondary">Printed Pages ({getPrintedPages()}):</span>
                     <span className="fw-semibold">
-                      ₹{files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + computeItemAmount(f.pageCount, f.copies, f.category, f.duplex), 0).toFixed(2)}
+                      ₹{files.filter((f) => f.category !== 'BLANK').reduce((acc, f) => acc + priceItem(f), 0).toFixed(2)}
                     </span>
                   </div>
                 )}
                 {getBlankPages() > 0 && (
                   <div className="d-flex justify-content-between border-bottom border-secondary pb-2 mb-3">
-                    <span className="text-secondary">Blank Sheets ({getBlankPages()} × ₹{BLANK_COST_PER_PAGE.toFixed(2)}):</span>
-                    <span className="fw-semibold">₹{(getBlankPages() * BLANK_COST_PER_PAGE).toFixed(2)}</span>
+                    <span className="text-secondary">Blank Sheets ({getBlankPages()} × ₹{blankCostPerPage.toFixed(2)}):</span>
+                    <span className="fw-semibold">₹{(getBlankPages() * blankCostPerPage).toFixed(2)}</span>
                   </div>
                 )}
 
