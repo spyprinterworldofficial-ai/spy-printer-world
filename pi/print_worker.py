@@ -1,36 +1,22 @@
 """
 S.py Printing World — Raspberry Pi print worker.
 
-Runs continuously. Each cycle it:
-  1. Sends a heartbeat (checks internet + printer reachability, updates the
-     `printers` row so the kiosk website's status indicator stays accurate).
-     Self-heals wifi if it can't actually reach Supabase for a while, even
-     if a generic internet check looks fine.
-  2. Keeps LibreOffice "warm" in the background so nobody's PPT/DOC pays a
-     ~20s cold-start penalty just for being the first one processed in a
-     while.
-  3. Looks for a COUNTING job (a PPT/DOC someone just selected, waiting for
-     its real page count) and, if found, converts it and writes back the
-     exact page count + price. This only needs internet, not the physical
-     printer, so it still runs even if the USB cable is unplugged.
-  4. Looks for the oldest PAID job and, if the physical printer is
-     reachable, downloads/generates, converts if needed, extracts a page
-     range if one was requested, and prints it — waiting for the printer to
-     actually finish before considering the job done, so a multi-file order
-     can't have two jobs racing on the same physical printer.
-  5. Marks jobs COMPLETED/FAILED/COUNT_FAILED as appropriate and updates
-     paper/cartridge counters (duplex-aware: paper tracks physical sheets,
-     cartridge/toner tracks logical pages printed either way).
+Threads
+  heartbeat   every few seconds: internet/printer checks, capability flags, wifi self-heal
+  AI job      one at a time: page counting, Green AI, cheat sheet / executive summary (COUNTING jobs)
+  main        keeps printing PAID jobs while the AI thread works
 
-Run this directly for testing, or install it as a systemd service (see
-spy-print-worker.service in this same folder) so it survives reboots and
-restarts automatically if it crashes.
+AI features need `ai_engine.py` + its libraries. Without them this worker still prints normally
+and simply reports ai_ready/slm_ready = false so the kiosk hides those options.
 """
 
+import hashlib
 import os
+import re
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -41,19 +27,18 @@ from supabase import create_client, Client
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 
+try:
+    import ai_engine
+except Exception as e:  # missing libs on a Pi that hasn't been upgraded yet
+    ai_engine = None
+    print(f"[startup] AI features disabled: {e}")
+
+import inspector  # mandatory: nothing reaches the printer without passing it (fail closed)
+from inspector import FileRejected
+
 load_dotenv()
 
-# Critical safety net: without this, a network call that never gets a
-# reply (a routing "black hole" — packets go out, nothing ever comes back,
-# no explicit rejection) can hang a socket-level operation forever. That's
-# different from a normal connection failure, which raises promptly and
-# gets caught by our except blocks — a true hang bypasses error handling
-# entirely, since there's never an exception to catch. This showed up as
-# the worker going completely silent after certain reboots: not logging
-# errors, not logging heartbeats, just frozen mid-call. Setting a global
-# socket timeout means EVERY blocking network operation in this process
-# is guaranteed to eventually raise instead of hanging indefinitely, so
-# our retry/self-heal logic always gets a chance to run.
+# Any blocking network call must eventually raise, otherwise a routing black hole freezes the worker silently.
 socket.setdefaulttimeout(15)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -61,27 +46,30 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 PRINTER_ID = os.environ["PRINTER_ID"]
 CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
-# Pricing now lives per-printer in the `printers` table, not env vars —
-# different printers/institutes can charge different rates. Fetched fresh
-# each time process_counting_job needs it (see fetch_this_printer_pricing
-# below), so a price change in the database takes effect on the very next
-# job, no restart needed. These are only the fallback if the DB row
-# somehow lacks the columns.
-FALLBACK_COST_PER_PAGE = 5.0
-FALLBACK_DUPLEX_COST_PER_SHEET = 4.5
 
 STORAGE_BUCKET = "print-files"
+MAX_COPIES_PER_JOB = int(os.environ.get("MAX_COPIES_PER_JOB", "50"))
+OFFICE_SUFFIXES = {".ppt", ".pptx", ".pps", ".ppsx", ".odp", ".doc", ".docx", ".odt", ".rtf"}
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
+LIBREOFFICE_KEEPWARM_INTERVAL = 25
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+FALLBACK_PRICING = {"cost_per_page": 5.0, "duplex_cost_per_sheet": 4.5, "green_ai_fee": 2.0,
+                    "cheatsheet_price": 4.0, "execsum_price": 8.0}
 
-# Tracks when LibreOffice was last actually used, so main_loop can
-# periodically re-warm it in the background during idle time — a one-time
-# warmup at service startup wasn't enough, since LibreOffice's "warm"
-# state was measured to last well under 60-70s on this hardware.
+
+def new_client() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+supabase: Client = new_client()  # main + AI thread (the heartbeat and telemetry threads get their own)
+
+lo_lock = threading.Lock()  # headless LibreOffice can't run two instances on one profile
 last_libreoffice_activity = 0.0
-LIBREOFFICE_KEEPWARM_INTERVAL = 25  # seconds — shorter than the measured "warm" window
+hb_lock = threading.Lock()
+hb = {"online": False, "printer_ok": False, "write_ok": False}
 
+
+# ---------------------------------------------------------------- checks / self-heal
 
 def check_internet() -> bool:
     try:
@@ -93,427 +81,454 @@ def check_internet() -> bool:
 
 def check_printer_connected() -> bool:
     try:
-        result = subprocess.run(
-            ["lpstat", "-p", CUPS_PRINTER_NAME],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0
+        r = subprocess.run(["lpstat", "-p", CUPS_PRINTER_NAME], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
     except Exception:
         return False
 
 
-def send_heartbeat():
-    online = check_internet()
-    printer_ok = check_printer_connected() if online else False
-    # Tracked separately from `online` (a generic Google ping) because the
-    # two can genuinely disagree — e.g. general internet works fine while
-    # Supabase specifically is unreachable (stale DNS entry, routing
-    # quirk). What actually matters for the whole system is whether we can
-    # reach Supabase, so self-healing below is gated on this, not the
-    # generic ping.
-    heartbeat_write_ok = False
-    try:
-        supabase.table("printers").update({
-            "pi_internet_online": online,
-            "pi_printer_connected": printer_ok,
-            "last_heartbeat": "now()",
-        }).eq("id", PRINTER_ID).execute()
-        heartbeat_write_ok = True
-    except Exception as e:
-        print(f"[heartbeat] failed to update: {e}")
-    return online, printer_ok, heartbeat_write_ok
-
-
 def try_reconnect_wifi():
-    """Runs `nmcli device connect wlan0` to nudge wifi back to life.
-    Requires passwordless sudo for this specific command. Used as a
-    self-healing fallback for a known Pi quirk where wifi sometimes
-    doesn't auto-connect cleanly after a fresh power cycle — a manual
-    `nmcli device connect wlan0` reliably fixes it when this happens, so
-    the worker does that automatically instead of needing someone to SSH
-    in and run it by hand."""
+    """`nmcli device connect wlan0` fixes the occasional post-boot wifi stall (needs passwordless sudo)."""
     try:
-        result = subprocess.run(
-            ["sudo", "nmcli", "device", "connect", "wlan0"],
-            capture_output=True, text=True, timeout=30,
-        )
-        print(f"[wifi-heal] reconnect attempt: {result.stdout.strip() or result.stderr.strip()}")
+        r = subprocess.run(["sudo", "nmcli", "device", "connect", "wlan0"], capture_output=True, text=True, timeout=30)
+        print(f"[wifi-heal] {r.stdout.strip() or r.stderr.strip()}")
     except Exception as e:
-        print(f"[wifi-heal] reconnect attempt failed: {e}")
+        print(f"[wifi-heal] failed: {e}")
+
+
+def detect_capabilities() -> dict:
+    ai_ready = ai_engine is not None
+    return {"ai_ready": ai_ready, "slm_ready": ai_ready and ai_engine.slm_available()}
+
+
+def heartbeat_loop():
+    client = new_client()
+    failures, last_caps, caps, warned = 0, 0.0, {"ai_ready": False, "slm_ready": False}, False
+    reconnect_every = max(1, round(60 / POLL_INTERVAL_SECONDS))
+    while True:
+        try:
+            online = check_internet()
+            printer_ok = check_printer_connected() if online else False
+            if time.time() - last_caps > 30:
+                caps, last_caps = detect_capabilities(), time.time()
+            base = {"pi_internet_online": online, "pi_printer_connected": printer_ok, "last_heartbeat": "now()"}
+            ok = False
+            try:
+                client.table("printers").update({**base, **caps}).eq("id", PRINTER_ID).execute()
+                ok = True
+            except Exception as e:
+                try:  # capability columns missing (migration not run yet) — keep the heartbeat alive
+                    client.table("printers").update(base).eq("id", PRINTER_ID).execute()
+                    ok = True
+                    if not warned:
+                        print(f"[heartbeat] capability columns missing, run the AI migration ({e})")
+                        warned = True
+                except Exception as e2:
+                    print(f"[heartbeat] failed: {e2}")
+            with hb_lock:
+                hb.update(online=online, printer_ok=printer_ok, write_ok=ok)
+            if ok:
+                failures = 0
+            else:
+                failures += 1
+                if failures % reconnect_every == 0:
+                    try_reconnect_wifi()
+        except Exception as e:
+            print(f"[heartbeat] unexpected error: {e}")
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------- database / storage helpers
+
+def _first(resp):
+    rows = resp.data or []
+    return rows[0] if rows else None
 
 
 def fetch_next_job():
-    resp = (
-        supabase.table("print_jobs")
-        .select("*")
-        .eq("printer_id", PRINTER_ID)
-        .eq("status", "PAID")
-        .order("created_at", desc=False)
-        .limit(1)
-        .execute()
-    )
-    rows = resp.data or []
-    return rows[0] if rows else None
+    return _first(supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID)
+                  .eq("status", "PAID").order("created_at").limit(1).execute())
 
 
 def fetch_next_counting_job():
-    resp = (
-        supabase.table("print_jobs")
-        .select("*")
-        .eq("printer_id", PRINTER_ID)
-        .eq("status", "COUNTING")
-        .order("created_at", desc=False)
-        .limit(1)
-        .execute()
-    )
-    rows = resp.data or []
-    return rows[0] if rows else None
+    return _first(supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID)
+                  .eq("status", "COUNTING").order("created_at").limit(1).execute())
 
 
 def set_job_status(job_id: str, status: str, extra: dict | None = None):
-    payload = {"status": status}
-    if extra:
-        payload.update(extra)
-    supabase.table("print_jobs").update(payload).eq("id", job_id).execute()
+    supabase.table("print_jobs").update({"status": status, **(extra or {})}).eq("id", job_id).execute()
 
 
-def download_job_file(storage_path: str, dest_path: Path):
-    data = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
-    dest_path.write_bytes(data)
+def download_job_file(storage_path: str, dest: Path):
+    dest.write_bytes(supabase.storage.from_(STORAGE_BUCKET).download(storage_path))
 
 
-def convert_to_pdf(src_path: Path, workdir: Path) -> Path:
-    """Uses headless LibreOffice to convert PPT/DOC files to PDF. Used both
-    for actual printing and for exact page counting — the same conversion
-    either way, so the count someone pays for and the pages that actually
-    come out of the printer are always the same source of truth."""
-    global last_libreoffice_activity
-    last_libreoffice_activity = time.time()
-    subprocess.run(
-        [
-            "libreoffice", "--headless", "--norestore",
-            "--convert-to", "pdf", "--outdir", str(workdir), str(src_path),
-        ],
-        check=True, timeout=120,
-    )
-    pdf_path = workdir / (src_path.stem + ".pdf")
-    if not pdf_path.exists():
-        raise RuntimeError(f"LibreOffice conversion did not produce {pdf_path}")
-    return pdf_path
-
-
-def get_pdf_page_count(pdf_path: Path) -> int:
-    """Requires poppler-utils (`sudo apt install poppler-utils`) for the
-    `pdfinfo` command."""
-    result = subprocess.run(
-        ["pdfinfo", str(pdf_path)], capture_output=True, text=True, timeout=30, check=True
-    )
-    for line in result.stdout.splitlines():
-        if line.startswith("Pages:"):
-            return int(line.split(":", 1)[1].strip())
-    raise RuntimeError("Could not find a 'Pages:' line in pdfinfo output")
-
-
-def upload_converted_pdf(pdf_path: Path, original_storage_path: str) -> str:
-    """Uploads the PDF produced during counting back to Storage, so
-    printing later reuses this exact file instead of converting again —
-    guarantees the pages someone paid for are exactly the pages that get
-    printed, not a second, possibly slightly different, conversion of the
-    same source file (LibreOffice's conversion isn't perfectly
-    deterministic in every case)."""
-    converted_path = f"{original_storage_path}.converted.pdf"
+def upload_pdf(pdf_path: Path, target_path: str) -> str:
     with open(pdf_path, "rb") as f:
-        supabase.storage.from_(STORAGE_BUCKET).upload(
-            converted_path, f, file_options={"upsert": "true"}
-        )
-    return converted_path
+        supabase.storage.from_(STORAGE_BUCKET).upload(target_path, f, file_options={"upsert": "true"})
+    return target_path
 
 
-def extract_page_range(source_pdf: Path, page_range: str, workdir: Path) -> Path:
-    """Extracts only the specified pages into a new PDF using qpdf.
-    page_range is always a fully-expanded, deduped, sorted comma list
-    (e.g. "1,3,5,6,7,8,9,12") written by the frontend — never shorthand
-    like "5-9" — so there's no ambiguity between the page count someone
-    was billed for and what actually gets extracted here. Requires
-    `sudo apt install qpdf`."""
-    output_path = workdir / "page_range_extract.pdf"
-    subprocess.run(
-        ["qpdf", str(source_pdf), "--pages", str(source_pdf), page_range, "--", str(output_path)],
-        check=True, timeout=60,
-    )
-    if not output_path.exists():
-        raise RuntimeError("qpdf did not produce the extracted page range PDF")
-    return output_path
+def fetch_this_printer_pricing() -> dict:
+    """Fresh each time, so a price change in Supabase applies to the very next job."""
+    try:
+        row = (supabase.table("printers")
+               .select("cost_per_page, duplex_cost_per_sheet, green_ai_fee, cheatsheet_price, execsum_price")
+               .eq("id", PRINTER_ID).single().execute().data)
+        return {k: float(row.get(k, v)) for k, v in FALLBACK_PRICING.items()}
+    except Exception as e:
+        print(f"[pricing] using fallback prices: {e}")
+        return dict(FALLBACK_PRICING)
 
 
-def generate_blank_pdf(num_pages: int, output_path: Path):
-    """Blank-page orders never had a real file to begin with — this
-    generates the PDF fresh at print time instead of downloading or
-    converting anything. A4 to match everything else this printer
-    produces."""
-    c = canvas.Canvas(str(output_path), pagesize=A4)
+def compute_amount(pages: int, copies: int, duplex: bool, ai_mode, green_applied: bool, p: dict) -> float:
+    """Mirror of computeJobAmount() in lib/pricing.ts (blank pages never reach the Pi's counting step)."""
+    copies = max(1, copies)
+    if ai_mode == "CHEATSHEET":
+        return round(copies * p["cheatsheet_price"], 2)
+    if ai_mode == "EXECSUM":
+        return round(copies * p["execsum_price"], 2)
+    per_copy = ((pages // 2) * p["duplex_cost_per_sheet"] + (pages % 2) * p["cost_per_page"]) if duplex else pages * p["cost_per_page"]
+    return round(per_copy * copies + (p["green_ai_fee"] if green_applied else 0), 2)
+
+
+# ---------------------------------------------------------------- document tools
+
+def convert_to_pdf(src: Path, workdir: Path) -> Path:
+    global last_libreoffice_activity
+    with lo_lock:
+        last_libreoffice_activity = time.time()
+        try:
+            r = inspector.run_limited(
+                ["libreoffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", str(workdir), str(src)],
+                timeout=120, cpu=110, capture_output=True)
+        except FileRejected:
+            subprocess.run(["pkill", "-f", "soffice.bin"], capture_output=True)  # don't leave a runaway behind
+            raise
+    pdf = workdir / (src.stem + ".pdf")
+    if r.returncode != 0 or not pdf.exists():
+        subprocess.run(["pkill", "-f", "soffice.bin"], capture_output=True)
+        raise FileRejected("This document couldn't be converted safely. Try saving it as a PDF and uploading that.")
+    return pdf
+
+
+def warm_up_libreoffice():
+    """First headless call after idling costs ~20s; keep it warm so no student pays for that."""
+    global last_libreoffice_activity
+    if not lo_lock.acquire(blocking=False):
+        return  # a real conversion is running
+    try:
+        start = time.time()
+        subprocess.run(["libreoffice", "--headless", "--terminate_after_init"], timeout=40, capture_output=True)
+        print(f"[keepwarm] LibreOffice ready in {time.time() - start:.1f}s")
+    except Exception as e:
+        print(f"[keepwarm] failed (non-fatal): {e}")
+    finally:
+        last_libreoffice_activity = time.time()
+        lo_lock.release()
+
+
+def get_pdf_page_count(pdf: Path) -> int:
+    r = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True, timeout=30, check=True)
+    for line in r.stdout.splitlines():
+        if line.startswith("Pages:"):
+            return int(line.split(":", 1)[1])
+    raise RuntimeError("pdfinfo gave no page count")
+
+
+def extract_page_range(src: Path, page_range: str, workdir: Path) -> Path:
+    out = workdir / "page_range_extract.pdf"
+    subprocess.run(["qpdf", str(src), "--pages", str(src), page_range, "--", str(out)], check=True, timeout=60)
+    if not out.exists():
+        raise RuntimeError("qpdf produced no output")
+    return out
+
+
+def generate_blank_pdf(num_pages: int, out: Path):
+    c = canvas.Canvas(str(out), pagesize=A4)
     for _ in range(num_pages):
         c.showPage()
     c.save()
 
 
-def fetch_this_printer_pricing() -> tuple[float, float]:
-    """Reads THIS printer's own cost_per_page/duplex_cost_per_sheet from
-    its row in the `printers` table. Fetched fresh (not cached) so a price
-    change made anywhere — Supabase directly, or eventually the admin app
-    — takes effect on the very next job, no restart needed."""
-    try:
-        row = supabase.table("printers").select("cost_per_page, duplex_cost_per_sheet").eq("id", PRINTER_ID).single().execute().data
-        return (
-            float(row.get("cost_per_page", FALLBACK_COST_PER_PAGE)),
-            float(row.get("duplex_cost_per_sheet", FALLBACK_DUPLEX_COST_PER_SHEET)),
-        )
-    except Exception as e:
-        print(f"[pricing] failed to fetch this printer's pricing, using fallback: {e}")
-        return FALLBACK_COST_PER_PAGE, FALLBACK_DUPLEX_COST_PER_SHEET
-
-
-def compute_amount(pages: int, copies: int, duplex: bool, cost_per_page: float, duplex_cost_per_sheet: float) -> float:
-    """Shared pricing formula — must stay identical to computeItemAmount()
-    in the website's page.tsx and computeJobAmount() in
-    create-razorpay-order/route.ts. A duplex job prices in pairs: one
-    discounted sheet covers 2 pages. A leftover odd page can't be
-    duplexed (nothing to print on its back), so it's charged at the plain
-    single-side rate. (Blank-page orders are priced by the website/route
-    directly and never reach this function, since the Pi only ever counts
-    real PPT/DOC files.)"""
-    n = pages * copies
-    if duplex:
-        pairs = n // 2
-        leftover = n % 2
-        return pairs * duplex_cost_per_sheet + leftover * cost_per_page
-    return n * cost_per_page
-
-
-def print_file(pdf_or_image_path: Path, copies: int, duplex: bool = False):
+def print_file(path: Path, copies: int, duplex: bool = False):
     cmd = ["lp", "-d", CUPS_PRINTER_NAME, "-n", str(max(1, copies))]
     if duplex:
         cmd += ["-o", "Duplex=DuplexNoTumble"]
-    cmd.append(str(pdf_or_image_path))
-    subprocess.run(cmd, check=True, timeout=60)
+    subprocess.run(cmd + [str(path)], check=True, timeout=60)
 
 
 def wait_until_printer_idle(timeout_seconds: int = 120):
-    """`lp` returns as soon as CUPS *accepts* a job into the queue — not
-    once the printer has actually finished physically printing it. With a
-    single file that timing gap never matters, but back-to-back files
-    (e.g. a multi-file order) can have the next job submitted to CUPS
-    while the printer is still mid-way through the previous one, and some
-    driver/printer combinations silently drop or mishandle a job that
-    arrives while they're still busy — CUPS still reports success, so
-    nothing looks wrong in our logs even though nothing came out.
-    Waiting here until CUPS reports the printer idle again, before we
-    consider the job truly done and move on to the next one, closes that
-    gap."""
+    """`lp` returns once CUPS accepts a job, not when paper is out; wait so back-to-back jobs don't collide."""
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            result = subprocess.run(
-                ["lpstat", "-p", CUPS_PRINTER_NAME],
-                capture_output=True, text=True, timeout=10,
-            )
-            if "is idle" in result.stdout:
-                return True
+            r = subprocess.run(["lpstat", "-p", CUPS_PRINTER_NAME], capture_output=True, text=True, timeout=10)
+            if "is idle" in r.stdout:
+                return
         except Exception:
             pass
         time.sleep(2)
-    print(f"[print] Warning: printer did not report idle within {timeout_seconds}s — proceeding anyway.")
-    return False
+    print(f"[print] printer not idle after {timeout_seconds}s — continuing")
 
 
-def warm_up_libreoffice():
-    """LibreOffice's first headless invocation after being idle pays a
-    one-time ~20s startup cost (profile init, font loading) completely
-    separate from actual conversion time — every invocation after that,
-    while it stays "warm", is near-instant. Called once at service
-    startup and then periodically from main_loop during idle time, so
-    nobody's real file has to pay this cost themselves."""
-    global last_libreoffice_activity
-    print("[keepwarm] warming up LibreOffice...")
-    start = time.time()
-    try:
-        subprocess.run(
-            ["libreoffice", "--headless", "--terminate_after_init"],
-            timeout=40, capture_output=True,
-        )
-        print(f"[keepwarm] LibreOffice warmed up in {time.time() - start:.1f}s")
-    except Exception as e:
-        # Non-fatal — worst case, the first real job just pays the cold
-        # start cost itself, same as before this fix existed.
-        print(f"[keepwarm] LibreOffice warmup failed (non-fatal): {e}")
-    last_libreoffice_activity = time.time()
+def parse_page_list(page_range: str | None, total: int) -> list[int]:
+    if not page_range:
+        return list(range(1, total + 1))
+    pages = sorted({int(p) for p in page_range.split(",") if p.strip().isdigit() and 1 <= int(p) <= total})
+    if not pages:
+        raise ValueError("The selected page range is outside this document.")
+    return pages
 
+
+# ---------------------------------------------------------------- untrusted-file inspection
+
+def safe_upload_name(ftype: str, name: str) -> str:
+    """Never use the student's file name on disk (path tricks, odd characters); keep only a vetted extension."""
+    suffix = Path(name).suffix.lower()
+    if ftype in CONVERTIBLE_CATEGORIES:
+        if suffix not in OFFICE_SUFFIXES:
+            raise FileRejected("This file type isn't supported. Please upload a .pptx, .ppt, .docx or .doc file.")
+        return "upload" + suffix
+    return "upload.bin"
+
+
+def inspect_upload(ftype: str, original: Path, wd: Path) -> tuple[Path, dict]:
+    """Original upload -> rebuilt clean PDF. Raises FileRejected with a student-readable reason."""
+    clean = wd / "clean.pdf"
+    if ftype in CONVERTIBLE_CATEGORIES:
+        inspector.check_office_container(original)
+        info = inspector.sanitize("pdf", convert_to_pdf(original, wd), clean)
+    else:
+        info = inspector.sanitize("image" if ftype == "IMAGE" else "pdf", original, clean)
+    if not info["ink_ok_eco"]:
+        raise FileRejected("This file is almost entirely solid black or extremely ink-heavy, so it can't be printed here.")
+    info["ink_forced"] = not info["ink_ok_raw"]  # heavy but legitimate (dark slides): Eco-Ink is forced on
+    return clean, info
+
+
+def reject_upload(job: dict, reason: str):
+    """Mark the job rejected (the kiosk shows the reason) and delete the offending bytes."""
+    print(f"[reject {job['id']}] {job.get('file_name')}: {reason}")
+    supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_error": ("REJECTED: " + reason)[:200], "ai_telemetry": None}) \
+        .eq("id", job["id"]).execute()
+    paths = [p for p in (job.get("storage_path"), job.get("converted_pdf_path"), job.get("ai_pdf_path")) if p]
+    if paths:
+        try:
+            supabase.storage.from_(STORAGE_BUCKET).remove(paths)
+        except Exception as e:
+            print(f"[reject {job['id']}] cleanup skipped: {e}")
+
+
+# ---------------------------------------------------------------- AI / counting job (runs on its own thread)
 
 def process_counting_job(job: dict):
-    """Converts a PPT/DOC to find its exact page count, then writes the
-    real pages_count + amount_paid back and flips the job to PENDING
-    (ready for checkout). The converted PDF is uploaded back to Storage
-    (converted_pdf_path) so that printing later reuses this exact file
-    instead of re-converting.
+    """COUNTING covers: exact page count of a PPT/DOC, Green AI compression, and summary generation."""
+    jid, ftype, name = job["id"], job["file_type"], job["file_name"]
+    ai_mode, green = job.get("ai_mode"), bool(job.get("green_ai"))
+    wants_ai = bool(ai_mode or green)
+    copies = job.get("copies") or 1
+    duplex = bool(job.get("duplex")) or ai_mode == "EXECSUM"
+    print(f"[count {jid}] {name} ({ftype}){' ' + ai_mode if ai_mode else ''}{' GREEN' if green else ''}")
 
-    Every write here is guarded with .eq('status', 'COUNTING') so that if
-    the website deleted this job in the meantime (person removed the file
-    before we finished), the update simply matches zero rows instead of
-    resurrecting a row the person already discarded."""
-    job_id = job["id"]
-    file_name = job["file_name"]
-    storage_path = job["storage_path"]
-    copies = job.get("copies", 1) or 1
-    duplex = job.get("duplex", False)
-
-    print(f"[count {job_id}] counting pages for {file_name}")
+    if wants_ai and ai_engine is None:
+        raise RuntimeError("AI features aren't installed on this printer yet.")
 
     with tempfile.TemporaryDirectory() as tmp:
-        workdir = Path(tmp)
-        local_path = workdir / file_name
-        download_job_file(storage_path, local_path)
-        pdf_path = convert_to_pdf(local_path, workdir)
-        pages = get_pdf_page_count(pdf_path)
-        converted_pdf_path = upload_converted_pdf(pdf_path, storage_path)
+        wd = Path(tmp)
+        src = wd / "source.pdf"
+        conv_path = job.get("converted_pdf_path")
+        ink_forced = bool(job.get("ink_forced"))
+        inspected = {}
 
-    cost_per_page, duplex_cost_per_sheet = fetch_this_printer_pricing()
-    amount = compute_amount(pages, copies, duplex, cost_per_page, duplex_cost_per_sheet)
-    supabase.table("print_jobs").update({
-        "pages_count": pages,
-        "amount_paid": amount,
-        "status": "PENDING",
-        "converted_pdf_path": converted_pdf_path,
-    }).eq("id", job_id).eq("status", "COUNTING").execute()
-    print(f"[count {job_id}] done: {pages} pages, Rs.{amount}")
+        if job.get("inspected_at") and conv_path:
+            # Already vetted earlier (this is an AI request on a PENDING job). Re-vet anyway: storage isn't trusted.
+            raw = wd / "prev.pdf"
+            download_job_file(conv_path, raw)
+            info = inspector.sanitize("pdf", raw, src)
+            base = info["pages"]
+        else:
+            original = wd / safe_upload_name(ftype, name)
+            download_job_file(job["storage_path"], original)
+            clean, info = inspect_upload(ftype, original, wd)
+            clean.replace(src)
+            base, ink_forced = info["pages"], info["ink_forced"]
+            conv_path = upload_pdf(src, f"{job['storage_path']}.clean.pdf")
+            inspected = {"inspected_at": "now()", "ink_forced": ink_forced, "eco_ink": True if ink_forced else job.get("eco_ink")}
+            try:  # the original is no longer needed; only the rebuilt PDF is ever printed
+                supabase.storage.from_(STORAGE_BUCKET).remove([job["storage_path"]])
+            except Exception:
+                pass
+
+        patch = {"base_pages_count": base, "ai_error": None, "ai_telemetry": None,
+                 "pages_count": base, "converted_pdf_path": conv_path, "status": "PENDING", **inspected}
+        green_applied = False
+
+        if wants_ai:
+            out = wd / "ai_out.pdf"
+            with ai_engine.Telemetry(new_client(), jid) as tele, ai_engine.pinned_cores():
+                if ai_mode:
+                    result = ai_engine.make_summary(ai_mode, src, parse_page_list(job.get("page_range"), base), out,
+                                                    Path(name).stem, tele)
+                else:
+                    result = ai_engine.green_ai_compress(src, out, tele)
+            if ai_mode or result["pages"] < base:
+                patch.update(pages_count=result["pages"], ai_pages_count=result["pages"],
+                             ai_pdf_path=upload_pdf(out, f"{job['storage_path']}.ai.pdf"),
+                             ai_score=result.get("score"), ai_note=result["note"])
+                green_applied = bool(green)
+            else:  # Green AI found nothing to save: print the original, no fee
+                patch.update(green_ai=False, ai_pages_count=None, ai_pdf_path=None, ai_note=result["note"])
+
+        patch["amount_paid"] = compute_amount(patch["pages_count"], copies, duplex, ai_mode, green_applied,
+                                              fetch_this_printer_pricing())
+        supabase.table("print_jobs").update(patch).eq("id", jid).eq("status", "COUNTING").execute()
+    print(f"[count {jid}] done: {patch['pages_count']} pages, Rs.{patch['amount_paid']}")
+
+
+def run_counting_job(job: dict):
+    try:
+        process_counting_job(job)
+    except FileRejected as e:
+        try:
+            reject_upload(job, str(e))
+        except Exception as inner:
+            print(f"[count {job['id']}] could not record rejection: {inner}")
+    except Exception as e:
+        print(f"[count {job['id']}] FAILED: {e}")
+        traceback.print_exc()
+        friendly = str(e) if isinstance(e, (ValueError, RuntimeError)) else "Something went wrong while preparing this file."
+        try:
+            supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_error": friendly[:200], "ai_telemetry": None}) \
+                .eq("id", job["id"]).eq("status", "COUNTING").execute()
+        except Exception:
+            try:  # ai_error column missing
+                supabase.table("print_jobs").update({"status": "COUNT_FAILED"}).eq("id", job["id"]).eq("status", "COUNTING").execute()
+            except Exception as inner:
+                print(f"[count {job['id']}] could not mark COUNT_FAILED: {inner}")
+
+
+# ---------------------------------------------------------------- printing
+
+def apply_eco_ink(target: Path, ftype: str, wd: Path):
+    """Returns (path_to_print, ink_saved_pct or None). Never raises: eco-ink must not block a paid print."""
+    if ai_engine is None:
+        return target, None
+    try:
+        if ftype == "IMAGE":
+            stats = ai_engine.eco_ink_image(target, wd / "eco.png")
+            return wd / "eco.png", stats["ink_saved_pct"]
+        stats = ai_engine.eco_ink_pdf(target, wd / "eco.pdf")
+        return (wd / "eco.pdf", stats["ink_saved_pct"]) if stats else (target, 0.0)
+    except Exception as e:
+        print(f"[eco-ink] skipped: {e}")
+        return target, None
 
 
 def process_job(job: dict):
-    job_id = job["id"]
-    file_name = job["file_name"]
-    storage_path = job["storage_path"]
-    file_type = job["file_type"]
-    converted_pdf_path = job.get("converted_pdf_path")
-    page_range = job.get("page_range")
-    duplex = job.get("duplex", False)
-    pages_count = job["pages_count"]
-    copies = job.get("copies", 1) or 1
+    jid, name, ftype = job["id"], job["file_name"], job["file_type"]
+    ai_mode, green = job.get("ai_mode"), bool(job.get("green_ai"))
+    page_range, converted, ai_path = job.get("page_range"), job.get("converted_pdf_path"), job.get("ai_pdf_path")
+    pages, copies = job["pages_count"], job.get("copies") or 1
+    duplex = bool(job.get("duplex")) or ai_mode == "EXECSUM"
+    print(f"[job {jid}] {name} ({ftype}, {pages}p x{copies}{', duplex' if duplex else ''}"
+          f"{', ' + ai_mode if ai_mode else ''}{', green' if green else ''}{', eco-ink' if job.get('eco_ink') else ''})")
+    set_job_status(jid, "PRINTING")
 
-    print(f"[job {job_id}] picked up: {file_name} ({file_type}, {pages_count}p x{copies}"
-          f"{', duplex' if duplex else ''}{', pages ' + page_range if page_range else ''})")
-    set_job_status(job_id, "PRINTING")
-
+    ink_saved = None
     with tempfile.TemporaryDirectory() as tmp:
-        workdir = Path(tmp)
-
-        if file_type == 'BLANK':
-            print(f"[job {job_id}] generating {pages_count} blank page(s)")
-            print_target = workdir / "blank.pdf"
-            generate_blank_pdf(pages_count, print_target)
-        elif file_type in CONVERTIBLE_CATEGORIES and converted_pdf_path:
-            # Reuse the exact PDF that was already produced and counted
-            # during the counting phase, instead of converting the source
-            # file again.
-            print(f"[job {job_id}] reusing already-converted PDF from counting phase")
-            print_target = workdir / "converted.pdf"
-            download_job_file(converted_pdf_path, print_target)
+        wd = Path(tmp)
+        if ftype == "BLANK":
+            target = wd / "blank.pdf"
+            generate_blank_pdf(pages, target)
         else:
-            local_path = workdir / file_name
-            download_job_file(storage_path, local_path)
-            print_target = local_path
-            if file_type in CONVERTIBLE_CATEGORIES:
-                # Fallback path — only hit if a job somehow has no saved
-                # conversion (e.g. an older job created before this
-                # feature existed). Converts fresh, same as before.
-                print(f"[job {job_id}] no saved conversion found, converting {file_type} fresh...")
-                print_target = convert_to_pdf(local_path, workdir)
+            if not job.get("inspected_at"):
+                raise FileRejected("This file was never checked and can't be printed.")
+            source_path = ai_path if (ai_mode or green) else converted
+            if not source_path:
+                raise FileRejected("The prepared file for this job is missing.")
+            target = wd / "in.pdf"
+            download_job_file(source_path, target)
 
-        # Applied last, after whichever PDF we're going to print has been
-        # resolved above — this is what makes sure only the paid-for pages
-        # ever reach the printer, regardless of file type or conversion path.
-        if page_range and file_type not in ('IMAGE', 'BLANK'):
-            print(f"[job {job_id}] extracting pages {page_range} before printing")
-            print_target = extract_page_range(print_target, page_range, workdir)
+            if page_range and not (ai_mode or green):
+                if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,999}", page_range):
+                    raise FileRejected("The selected page range isn't valid.")
+                target = extract_page_range(target, page_range, wd)
 
-        print(f"[job {job_id}] sending to printer '{CUPS_PRINTER_NAME}'...")
-        print_file(print_target, copies, duplex)
+            if job.get("eco_ink") or job.get("ink_forced"):
+                target, ink_saved = apply_eco_ink(target, "PDF", wd)
 
-    print(f"[job {job_id}] waiting for printer to finish before considering this job done...")
+            # Last gate. Storage and the browser-editable columns aren't trusted, so what is about to hit CUPS
+            # is rebuilt and re-measured: never more pages than were paid for, never an ink bomb.
+            final = wd / "final.pdf"
+            info = inspector.sanitize("pdf", target, final)
+            if info["pages"] > pages:
+                raise FileRejected("The page count doesn't match what was paid for, so this job wasn't printed.")
+            if not info["ink_ok_raw"]:
+                raise FileRejected("This file is too ink-heavy to print.")
+            target = final
+
+        if copies > MAX_COPIES_PER_JOB:
+            raise FileRejected("Too many copies requested.")
+
+        print(f"[job {jid}] sending to '{CUPS_PRINTER_NAME}'")
+        print_file(target, copies, duplex)
+
     wait_until_printer_idle()
 
-    # Deduct paper/toner. Duplex halves the physical sheets used for the
-    # same number of printed pages (paper tracks sheets), but toner lands
-    # on both sides either way (cartridge tracks logical pages,
-    # unaffected by duplex). Never go negative on paper — floor at 0 so
-    # the low-paper warning on the kiosk still shows correctly.
-    n = pages_count * copies
-    sheets_used = -(-n // 2) if duplex else n  # ceiling division when duplex
-    printer_row = supabase.table("printers").select("paper_remaining, cartridge_page_count").eq("id", PRINTER_ID).single().execute().data
-    new_remaining = max(0, printer_row["paper_remaining"] - sheets_used)
-    new_cartridge_count = (printer_row.get("cartridge_page_count") or 0) + n
+    # Paper counts sheets (a duplex copy of an odd page count still uses ceil(p/2) sheets);
+    # toner counts logical pages either way.
+    sheets = (-(-pages // 2)) * copies if duplex else pages * copies
+    row = supabase.table("printers").select("paper_remaining, cartridge_page_count").eq("id", PRINTER_ID).single().execute().data
+    remaining = max(0, row["paper_remaining"] - sheets)
     supabase.table("printers").update({
-        "paper_remaining": new_remaining,
-        "cartridge_page_count": new_cartridge_count,
+        "paper_remaining": remaining,
+        "cartridge_page_count": (row.get("cartridge_page_count") or 0) + pages * copies,
     }).eq("id", PRINTER_ID).execute()
 
-    set_job_status(job_id, "COMPLETED")
-    print(f"[job {job_id}] done. paper_remaining now {new_remaining}")
-
-    # The converted PDF was only ever a working artifact for counting +
-    # printing — clean it up now that the job is done, so Storage doesn't
-    # accumulate a permanent duplicate of every PPT/DOC ever printed.
-    if converted_pdf_path:
+    set_job_status(jid, "COMPLETED")
+    if ink_saved is not None:
         try:
-            supabase.storage.from_(STORAGE_BUCKET).remove([converted_pdf_path])
-        except Exception as e:
-            print(f"[job {job_id}] could not clean up converted PDF (non-fatal): {e}")
+            supabase.table("print_jobs").update({"ink_saved_pct": ink_saved}).eq("id", jid).execute()
+        except Exception:
+            pass
+    print(f"[job {jid}] done. paper_remaining={remaining}{f', ink saved {ink_saved}%' if ink_saved else ''}")
 
+    leftovers = [p for p in (converted, ai_path) if p]
+    if leftovers:
+        try:
+            supabase.storage.from_(STORAGE_BUCKET).remove(leftovers)
+        except Exception as e:
+            print(f"[job {jid}] cleanup skipped: {e}")
+
+
+# ---------------------------------------------------------------- main loop
 
 def main_loop():
-    print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}'")
-    consecutive_offline_cycles = 0
-    # Only nudge wifi every ~60s of continuous "can't reach Supabase", not
-    # every single cycle — avoids hammering nmcli uselessly while giving
-    # it real chances to recover.
-    RECONNECT_EVERY_N_CYCLES = max(1, round(60 / POLL_INTERVAL_SECONDS))
+    print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}")
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    warm_up_libreoffice()
+    ai_thread, last_warn = None, 0.0
 
     while True:
         try:
-            online, printer_ok, heartbeat_write_ok = send_heartbeat()
-
             if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
                 warm_up_libreoffice()
 
-            if not heartbeat_write_ok:
-                # Gated on whether we could actually reach Supabase, not
-                # the generic `online` ping — those two can genuinely
-                # disagree (general internet fine, Supabase specifically
-                # unreachable), and what actually matters is Supabase
-                # reachability.
-                consecutive_offline_cycles += 1
-                print(f"[loop] can't reach Supabase — skipping this cycle (failing for {consecutive_offline_cycles} cycles, general internet check: {online})")
-                if consecutive_offline_cycles % RECONNECT_EVERY_N_CYCLES == 0:
-                    try_reconnect_wifi()
-            else:
-                consecutive_offline_cycles = 0
-                # Page counting only needs internet + LibreOffice, not the
-                # physical printer — it still runs even if someone's
-                # unplugged the USB cable, unlike actual printing below.
-                counting_job = fetch_next_counting_job()
-                if counting_job:
-                    try:
-                        process_counting_job(counting_job)
-                    except Exception as e:
-                        print(f"[count {counting_job['id']}] FAILED: {e}")
-                        traceback.print_exc()
-                        try:
-                            supabase.table("print_jobs").update({"status": "COUNT_FAILED"}) \
-                                .eq("id", counting_job["id"]).eq("status", "COUNTING").execute()
-                        except Exception as inner:
-                            print(f"[count {counting_job['id']}] could not mark COUNT_FAILED: {inner}")
+            with hb_lock:
+                write_ok, printer_ok = hb["write_ok"], hb["printer_ok"]
 
-                if not printer_ok:
-                    print("[loop] printer not reachable via CUPS — skipping print job check this cycle")
-                else:
+            if not write_ok:
+                if time.time() - last_warn > 30:
+                    print("[loop] can't reach Supabase — waiting (heartbeat thread is retrying)")
+                    last_warn = time.time()
+            else:
+                if ai_thread is None or not ai_thread.is_alive():
+                    counting = fetch_next_counting_job()
+                    if counting:
+                        ai_thread = threading.Thread(target=run_counting_job, args=(counting,), daemon=True)
+                        ai_thread.start()
+                if printer_ok:
                     job = fetch_next_job()
                     if job:
                         try:
@@ -522,16 +537,15 @@ def main_loop():
                             print(f"[job {job['id']}] FAILED: {e}")
                             traceback.print_exc()
                             try:
-                                set_job_status(job["id"], "FAILED")
+                                extra = {"ai_error": ("REJECTED: " + str(e))[:200]} if isinstance(e, FileRejected) else None
+                                set_job_status(job["id"], "FAILED", extra)
                             except Exception as inner:
-                                print(f"[job {job['id']}] could not even mark as FAILED: {inner}")
+                                print(f"[job {job['id']}] could not mark FAILED: {inner}")
         except Exception as e:
             print(f"[loop] unexpected error: {e}")
             traceback.print_exc()
-
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    warm_up_libreoffice()
     main_loop()

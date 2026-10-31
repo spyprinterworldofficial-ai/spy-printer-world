@@ -2,3 +2,7 @@ supabase==2.9.1
 python-dotenv==1.0.1
 requests==2.32.3
 reportlab==4.2.5
+PyMuPDF>=1.24.3
+opencv-python-headless>=4.10
+numpy>=1.26
+psutil>=5.9

@@ -1,63 +1,22 @@
 import { NextResponse } from 'next/server';
 import Razorpay from 'razorpay';
 import { createClient } from '@supabase/supabase-js';
+import { computeJobAmount, pricingFromPrinter, type PricingConfig } from '@/lib/pricing';
 
-// Server-only client — service role key bypasses RLS, which this route
-// needs to read/update any job regardless of who created it. Never expose
-// this key or this client to the browser.
-const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
-
-// Fallback ONLY — used if a job's printer row somehow lacks pricing
-// columns (shouldn't happen once the migration's run, but avoids a crash
-// either way). Real pricing always comes from that specific printer's own
-// row — different printers/institutes can charge different rates.
-const FALLBACK_COST_PER_PAGE = 5;
-const FALLBACK_BLANK_COST_PER_PAGE = 1.5;
-const FALLBACK_DUPLEX_COST_PER_SHEET = 4.5;
-
-// Shared formula — must stay byte-for-byte identical to computeItemAmount()
-// in page.tsx and compute_amount() in the Pi's print_worker.py. A duplex
-// job prices in pairs: one discounted sheet covers 2 pages. A leftover odd
-// page can't be duplexed (nothing to print on its back), so it's charged
-// at the plain single-side rate.
-function computeJobAmount(
-  pagesCount: number,
-  copies: number,
-  fileType: string,
-  duplex: boolean,
-  costPerPage: number,
-  duplexCostPerSheet: number,
-  blankCostPerPage: number
-): number {
-  const n = pagesCount * copies;
-  if (fileType === 'BLANK') return n * blankCostPerPage;
-  if (duplex) {
-    const pairs = Math.floor(n / 2);
-    const leftover = n % 2;
-    return pairs * duplexCostPerSheet + leftover * costPerPage;
-  }
-  return n * costPerPage;
-}
+// Service-role client: server only, never exposed to the browser.
+const supabaseAdmin = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 export async function POST(req: Request) {
   try {
     const { job_ids } = await req.json();
-
     if (!Array.isArray(job_ids) || job_ids.length === 0) {
       return NextResponse.json({ error: 'Missing job_ids' }, { status: 400 });
     }
 
-    // The charge is computed here, from the database, never trusting
-    // whatever the browser sends — a client could otherwise edit page
-    // counts / amounts in JS before this call and pay less than the real
-    // total. Only PENDING rows are trusted as "final" (COUNTING/
-    // COUNT_FAILED rows haven't settled on a real page count yet).
+    // The charge is always recomputed here from the database — never from anything the browser sends.
     const { data: jobs, error: fetchError } = await supabaseAdmin
       .from('print_jobs')
-      .select('id, pages_count, copies, status, file_type, duplex, printer_id')
+      .select('id, pages_count, copies, status, file_type, duplex, printer_id, ai_mode, green_ai, ai_pdf_path, inspected_at')
       .in('id', job_ids);
     if (fetchError) throw fetchError;
 
@@ -68,61 +27,57 @@ export async function POST(req: Request) {
     if (notReady) {
       return NextResponse.json({ error: `Job ${notReady.id} is not ready for payment (status: ${notReady.status})` }, { status: 400 });
     }
+    // Never take money for AI output the printer hasn't actually produced.
+    // Nothing is sold until the Pi has inspected the file and rebuilt it as a clean PDF.
+    const uninspected = jobs.find((j) => j.file_type !== 'BLANK' && !j.inspected_at);
+    if (uninspected) {
+      return NextResponse.json({ error: 'A file has not been checked yet. Please remove it and upload it again.' }, { status: 400 });
+    }
 
-    // All jobs in one order come from the same kiosk session, so they
-    // should all share the same printer_id — but fetch pricing per-job's
-    // actual printer_id anyway rather than assuming, in case that ever
-    // changes. Cache lookups so we don't re-query the same printer twice.
-    const printerPricingCache = new Map<string, { costPerPage: number; duplexCostPerSheet: number; blankCostPerPage: number }>();
-    const getPrinterPricing = async (printerId: string) => {
-      if (printerPricingCache.has(printerId)) return printerPricingCache.get(printerId)!;
-      const { data: printer } = await supabaseAdmin
-        .from('printers')
-        .select('cost_per_page, duplex_cost_per_sheet, blank_cost_per_page')
-        .eq('id', printerId)
-        .single();
-      const pricing = {
-        costPerPage: printer?.cost_per_page ?? FALLBACK_COST_PER_PAGE,
-        duplexCostPerSheet: printer?.duplex_cost_per_sheet ?? FALLBACK_DUPLEX_COST_PER_SHEET,
-        blankCostPerPage: printer?.blank_cost_per_page ?? FALLBACK_BLANK_COST_PER_PAGE,
-      };
-      printerPricingCache.set(printerId, pricing);
-      return pricing;
+    const missingAi = jobs.find((j) => (j.ai_mode || j.green_ai) && !j.ai_pdf_path);
+    if (missingAi) {
+      return NextResponse.json({ error: `AI output for job ${missingAi.id} isn't ready yet` }, { status: 400 });
+    }
+
+    const pricingCache = new Map<string, PricingConfig>();
+    const pricingFor = async (printerId: string) => {
+      if (!pricingCache.has(printerId)) {
+        const { data } = await supabaseAdmin
+          .from('printers')
+          .select('cost_per_page, duplex_cost_per_sheet, blank_cost_per_page, green_ai_fee, cheatsheet_price, execsum_price')
+          .eq('id', printerId)
+          .single();
+        pricingCache.set(printerId, pricingFromPrinter(data));
+      }
+      return pricingCache.get(printerId)!;
     };
 
     let amountRupees = 0;
     for (const j of jobs) {
-      const pricing = await getPrinterPricing(j.printer_id);
       amountRupees += computeJobAmount(
-        j.pages_count,
-        j.copies || 1,
-        j.file_type,
-        !!j.duplex,
-        pricing.costPerPage,
-        pricing.duplexCostPerSheet,
-        pricing.blankCostPerPage
+        {
+          pages: j.pages_count,
+          copies: j.copies || 1,
+          fileType: j.file_type,
+          duplex: !!j.duplex,
+          aiMode: j.ai_mode,
+          greenApplied: !!j.green_ai,
+        },
+        await pricingFor(j.printer_id)
       );
     }
-
     if (amountRupees <= 0) {
       return NextResponse.json({ error: 'Computed amount is zero' }, { status: 400 });
     }
 
-    const razorpay = new Razorpay({
-      key_id: process.env.RAZORPAY_KEY_ID!,
-      key_secret: process.env.RAZORPAY_KEY_SECRET!,
-    });
-
+    const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID!, key_secret: process.env.RAZORPAY_KEY_SECRET! });
     const order = await razorpay.orders.create({
-      amount: Math.round(amountRupees * 100), // Razorpay expects paise
+      amount: Math.round(amountRupees * 100), // paise
       currency: 'INR',
       receipt: `receipt_${Date.now()}`,
     });
 
-    // Tag the pending jobs with this order id now, before payment happens.
-    // This is what lets the webhook (which only knows the order id) find
-    // and update the right rows later, even if the browser never calls
-    // the verify endpoint.
+    // Tag the jobs with the order id now so the webhook can find them even if the browser never calls verify.
     const { error: tagError } = await supabaseAdmin
       .from('print_jobs')
       .update({ razorpay_order_id: order.id })
