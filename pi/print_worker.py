@@ -339,7 +339,7 @@ def process_counting_job(job: dict):
         src = wd / "source.pdf"
         conv_path = job.get("converted_pdf_path")
         ink_forced = bool(job.get("ink_forced"))
-        inspected = {}
+        inspected, drop_original = {}, None
 
         if job.get("inspected_at") and conv_path:
             # Already vetted earlier (this is an AI request on a PENDING job). Re-vet anyway: storage isn't trusted.
@@ -355,10 +355,7 @@ def process_counting_job(job: dict):
             base, ink_forced = info["pages"], info["ink_forced"]
             conv_path = upload_pdf(src, f"{job['storage_path']}.clean.pdf")
             inspected = {"inspected_at": "now()", "ink_forced": ink_forced, "eco_ink": True if ink_forced else job.get("eco_ink")}
-            try:  # the original is no longer needed; only the rebuilt PDF is ever printed
-                supabase.storage.from_(STORAGE_BUCKET).remove([job["storage_path"]])
-            except Exception:
-                pass
+            drop_original = job["storage_path"]  # deleted only after the result is safely saved
 
         patch = {"base_pages_count": base, "ai_error": None, "ai_telemetry": None,
                  "pages_count": base, "converted_pdf_path": conv_path, "status": "PENDING", **inspected}
@@ -383,6 +380,11 @@ def process_counting_job(job: dict):
         patch["amount_paid"] = compute_amount(patch["pages_count"], copies, duplex, ai_mode, green_applied,
                                               fetch_this_printer_pricing())
         supabase.table("print_jobs").update(patch).eq("id", jid).eq("status", "COUNTING").execute()
+        if drop_original:  # only the rebuilt PDF is ever printed; the untrusted original can go
+            try:
+                supabase.storage.from_(STORAGE_BUCKET).remove([drop_original])
+            except Exception:
+                pass
     print(f"[count {jid}] done: {patch['pages_count']} pages, Rs.{patch['amount_paid']}")
 
 
