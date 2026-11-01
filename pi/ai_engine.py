@@ -421,7 +421,15 @@ def slm_generate(prompt, max_tokens, tele=None, label="Generating"):
     parts, count = [], 0
     try:
         with requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, stream=True, timeout=(5, 180)) as r:
-            r.raise_for_status()
+            if r.status_code >= 400:  # Ollama explains itself in the body (e.g. "requires more system memory")
+                detail = r.text.strip()[:300]
+                print(f"[ollama] HTTP {r.status_code}: {detail}")
+                low = detail.lower()
+                if "memory" in low:
+                    raise RuntimeError("The printer doesn't have enough free memory for the AI engine right now. Please try again in a minute.")
+                if "not found" in low or "pull" in low:
+                    raise RuntimeError("The AI model isn't installed on this printer yet.")
+                raise RuntimeError(f"The AI engine returned an error ({r.status_code}).")
             for line in r.iter_lines():
                 if not line:
                     continue
