@@ -668,6 +668,25 @@ def _context_block(chunks):
     return "\n".join(f"[p.{c['page']}] {c['text']}" for c in chunks)
 
 
+def _extractive_points(ctx, limit, max_words=24):
+    """Fallback when the small model's output is unusable: the key sentences themselves, each cited. Never invents anything."""
+    out = []
+    for c in ctx:
+        for sent in re.split(r"(?<=[.!?])\s+", c["text"]):
+            w = sent.split()
+            if 7 <= len(w) <= 40:
+                out.append(f"{' '.join(w[:max_words])}{'...' if len(w) > max_words else ''} [p.{c['page']}]")
+                break
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extractive_overview(ctx, words=110):
+    text = " ".join(c["text"] for c in ctx[:3])
+    return " ".join(text.split()[:words]) + "..."
+
+
 def make_summary(mode: str, src: Path, pages: list[int], dst: Path, title: str, tele=None) -> dict:
     """mode: 'CHEATSHEET' (exactly 1 page) or 'EXECSUM' (exactly 3 pages). Returns {'pages','score','note'}."""
     _note(tele, "Reading your document", 0.03)
@@ -689,8 +708,11 @@ def make_summary(mode: str, src: Path, pages: list[int], dst: Path, title: str, 
                   f"{_context_block(ctx)}\n\nCHEAT SHEET:\n- ")
         raw = "- " + slm_generate(prompt, 360, tele, "Writing cheat sheet")
         bullets = parse_bullets(raw, 14)
-        if len(bullets) < 3:
-            raise RuntimeError("The AI engine didn't return a usable summary — please try again.")
+        fallback = len(bullets) < 3
+        if fallback:  # a 0.5B model occasionally ignores the format; fall back to the document's own key sentences
+            bullets = _extractive_points(ctx, 12)
+            if len(bullets) < 3:
+                raise RuntimeError("The AI engine didn't return a usable summary — please try again.")
         score = grounding_score(" ".join(bullets), source_text)
         _note(tele, "Typesetting the one-page cheat sheet", 0.97)
         terms = key_terms(chunks, sentences(page_texts), 10)
@@ -699,17 +721,28 @@ def make_summary(mode: str, src: Path, pages: list[int], dst: Path, title: str, 
         pages_out = 1
     else:
         ctx = diverse_context(ranked, chunks, 5)
-        prompt = ("You are a careful assistant writing an executive summary. Using ONLY the excerpts below, write:\n"
-                  "OVERVIEW: one paragraph of 90-130 words.\n"
-                  "KEY TAKEAWAYS: 7 bullet points, each starting with '- ', under 25 words, ending with its page like [p.3].\n"
-                  "Do not add facts that are not in the excerpts.\n\nEXCERPTS:\n"
-                  f"{_context_block(ctx)}\n\nOVERVIEW:\n")
-        raw = slm_generate(prompt, 520, tele, "Writing executive summary")
-        parts = re.split(r"(?i)key takeaways:?", raw, maxsplit=1)
-        overview = re.sub(r"(?i)^overview:?\s*", "", parts[0]).strip()
-        overview = re.sub(r"\s+", " ", overview)
-        takeaways = parse_bullets(parts[1] if len(parts) > 1 else raw, 8)
-        if len(overview.split()) < 25 or len(takeaways) < 3:
+        excerpts = _context_block(ctx)
+        # Two small, easy prompts work far better on a 0.5B model than one structured one.
+        overview, takeaways, fallback = "", [], False
+        for attempt in range(2):
+            raw = slm_generate("Using ONLY the excerpts below, write one paragraph of about 100 words summarising what this document is about. "
+                               "Do not add facts that are not in the excerpts. Plain prose, no lists.\n\nEXCERPTS:\n"
+                               f"{excerpts}\n\nSUMMARY PARAGRAPH:\n", 220, tele, "Writing the overview")
+            overview = re.sub(r"\s+", " ", re.sub(r"(?i)^\s*(overview|summary paragraph|summary):?\s*", "", raw)).strip()
+            if len(overview.split()) >= 25:
+                break
+        for attempt in range(2):
+            raw = "- " + slm_generate("Using ONLY the excerpts below, list 7 key takeaways. Each line starts with '- ', is under 25 words, and ends "
+                                      "with its page like [p.3]. Do not add facts that are not in the excerpts.\n\nEXCERPTS:\n"
+                                      f"{excerpts}\n\nKEY TAKEAWAYS:\n- ", 300, tele, "Writing the key takeaways")
+            takeaways = parse_bullets(raw, 8)
+            if len(takeaways) >= 3:
+                break
+        if len(overview.split()) < 25:
+            overview, fallback = _extractive_overview(ctx), True
+        if len(takeaways) < 3:
+            takeaways, fallback = _extractive_points(ctx, 7), True
+        if len(takeaways) < 3:
             raise RuntimeError("The AI engine didn't return a usable summary — please try again.")
         score = grounding_score(overview + " " + " ".join(takeaways), source_text)
         _note(tele, "Typesetting the 3-page executive summary", 0.97)
@@ -723,4 +756,5 @@ def make_summary(mode: str, src: Path, pages: list[int], dst: Path, title: str, 
 
     Path(dst).write_bytes(pdf)
     return {"pages": pages_out, "score": score,
-            "note": f"Grounding check: {score:.0f}% of the AI-written text's key terms appear in your document."}
+            "note": (f"Grounding check: {score:.0f}% of the AI-written text's key terms appear in your document."
+                     + (" Parts of this summary use the document's own key sentences." if fallback else ""))}
