@@ -290,9 +290,9 @@ def _coverage(gray) -> float:
 def measure_ink(pdf_path) -> dict:
     """Toner estimate per job, raw and as AI Eco-Ink would print it (when the AI libraries are installed)."""
     try:
-        import ai_engine as ai
+        import ink  # light module: not the whole AI toolkit (keeps the child process fast to start)
     except Exception:
-        ai = None
+        ink = None
     doc = fitz.open(pdf_path)
     raw, eco, flat = [], [], 0
     for page in doc:
@@ -301,7 +301,7 @@ def measure_ink(pdf_path) -> dict:
         c = _coverage(g)
         raw.append(c)
         flat += c >= INK_SOLID and float(g.std()) < FLAT_STD  # solid fill with no content: no legitimate use
-        eco.append(_coverage(ai.eco_ink_gray(g)) if ai and ai._page_needs_eco(g) else c)
+        eco.append(_coverage(ink.eco_ink_gray(g)) if ink and ink.page_needs_eco(g) else c)
 
     def verdict(cov):
         solid = sum(c >= INK_SOLID for c in cov)

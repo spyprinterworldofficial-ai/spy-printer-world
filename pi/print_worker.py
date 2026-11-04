@@ -49,6 +49,9 @@ CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 
 STORAGE_BUCKET = "print-files"
+COUNT_WORKERS = max(1, int(os.environ.get("COUNT_WORKERS", "2")))        # file checks that may run at once (Pi has 4 cores)
+MIN_FREE_MB_TO_START = int(os.environ.get("MIN_FREE_MB_TO_START", "450"))  # don't start another check when RAM is this tight
+COUNT_POLL_SECONDS = float(os.environ.get("COUNT_POLL_SECONDS", "1.5"))  # how soon a new upload gets picked up
 COUNT_WATCHDOG_SECONDS = int(os.environ.get("COUNT_WATCHDOG_SECONDS", "420"))  # AI summaries are slow on a Pi; normal checks take seconds
 MAX_COPIES_PER_JOB = int(os.environ.get("MAX_COPIES_PER_JOB", "50"))
 OFFICE_SUFFIXES = {".ppt", ".pptx", ".pps", ".ppsx", ".odp", ".doc", ".docx", ".odt", ".rtf"}
@@ -158,9 +161,20 @@ def fetch_next_job():
                   .eq("status", "PAID").order("created_at").limit(1).execute())
 
 
-def fetch_next_counting_job():
-    return _first(supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID)
-                  .eq("status", "COUNTING").order("created_at").limit(1).execute())
+def fetch_counting_jobs(limit: int = 12) -> list[dict]:
+    return (supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID)
+            .eq("status", "COUNTING").order("created_at").limit(limit).execute().data or [])
+
+
+def mem_available_mb() -> float:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 9999.0  # unknown (not Linux): don't block
 
 
 def set_job_status(job_id: str, status: str, extra: dict | None = None):
@@ -514,12 +528,66 @@ def process_job(job: dict):
 
 # ---------------------------------------------------------------- main loop
 
+def counting_dispatch_loop():
+    """Own thread: checks students' files side by side, independent of whatever the printing loop is doing."""
+    running: dict[str, tuple[threading.Thread, float, bool]] = {}  # job id -> (thread, started, uses_ai)
+    last_warn, last_busy_log = 0.0, 0.0
+    while True:
+        try:
+            with hb_lock:
+                write_ok = hb["write_ok"]
+            if not write_ok:
+                if time.time() - last_warn > 30:
+                    print("[count-loop] can't reach Supabase — waiting (heartbeat thread is retrying)")
+                    last_warn = time.time()
+            else:
+                for jid in [j for j, (t, _, _) in running.items() if not t.is_alive()]:
+                    del running[jid]
+
+                # Only one AI (Ollama) job at a time, since it needs the CPU cores; everything else runs in parallel.
+                if len(running) < COUNT_WORKERS:
+                    ai_running = any(uses_ai for _, _, uses_ai in running.values())
+                    for job in fetch_counting_jobs():
+                        if len(running) >= COUNT_WORKERS:
+                            break
+                        uses_ai = bool(job.get("ai_mode") or job.get("green_ai"))
+                        if job["id"] in running or (uses_ai and ai_running):
+                            continue
+                        if running and mem_available_mb() < MIN_FREE_MB_TO_START:
+                            break  # leave the rest queued until a running check frees memory
+                        t = threading.Thread(target=run_counting_job, args=(job,), daemon=True)
+                        running[job["id"]] = (t, time.time(), uses_ai)
+                        ai_running = ai_running or uses_ai
+                        t.start()
+
+                now = time.time()
+                for jid, (t, started, _) in list(running.items()):
+                    busy_for = now - started
+                    if busy_for > 60 and now - last_busy_log > 60:
+                        print(f"[count-loop] job {jid} has been running {busy_for:.0f}s")
+                        last_busy_log = now
+                    if busy_for > COUNT_WATCHDOG_SECONDS:  # a stuck job must never silently block the kiosk
+                        print(f"[watchdog] job {jid} exceeded {COUNT_WATCHDOG_SECONDS}s — failing it and restarting the worker")
+                        try:
+                            supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_telemetry": None,
+                                "ai_error": "This file took too long to prepare. Please try again."}) \
+                                .eq("id", jid).eq("status", "COUNTING").execute()
+                        finally:
+                            subprocess.run(["pkill", "-f", "soffice.bin"], capture_output=True)
+                            os._exit(3)  # systemd (Restart=always) brings the worker back clean
+        except Exception as e:
+            print(f"[count-loop] unexpected error: {e}")
+            traceback.print_exc()
+        time.sleep(COUNT_POLL_SECONDS)
+
+
 def main_loop():
-    print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}")
+    print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}, "
+          f"parallel checks={COUNT_WORKERS}")
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     warm_up_libreoffice()
-    ai_thread, last_warn = None, 0.0
-    busy_job, busy_since, last_busy_log = None, 0.0, 0.0
+    threading.Thread(target=counting_dispatch_loop, daemon=True).start()
+    last_warn = 0.0
 
     while True:
         try:
@@ -533,41 +601,19 @@ def main_loop():
                 if time.time() - last_warn > 30:
                     print("[loop] can't reach Supabase — waiting (heartbeat thread is retrying)")
                     last_warn = time.time()
-            else:
-                if ai_thread is None or not ai_thread.is_alive():
-                    counting = fetch_next_counting_job()
-                    if counting:
-                        busy_job, busy_since = counting["id"], time.time()
-                        ai_thread = threading.Thread(target=run_counting_job, args=(counting,), daemon=True)
-                        ai_thread.start()
-                else:
-                    # One stuck job must never silently block every later upload.
-                    busy_for = time.time() - busy_since
-                    if busy_for > 60 and time.time() - last_busy_log > 60:
-                        print(f"[loop] counting job {busy_job} has been running {busy_for:.0f}s — later uploads wait behind it")
-                        last_busy_log = time.time()
-                    if busy_for > COUNT_WATCHDOG_SECONDS:
-                        print(f"[watchdog] job {busy_job} exceeded {COUNT_WATCHDOG_SECONDS}s — failing it and restarting the worker")
+            elif printer_ok:
+                job = fetch_next_job()
+                if job:
+                    try:
+                        process_job(job)
+                    except Exception as e:
+                        print(f"[job {job['id']}] FAILED: {e}")
+                        traceback.print_exc()
                         try:
-                            supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_telemetry": None,
-                                "ai_error": "This file took too long to prepare. Please try again."}) \
-                                .eq("id", busy_job).eq("status", "COUNTING").execute()
-                        finally:
-                            subprocess.run(["pkill", "-f", "soffice.bin"], capture_output=True)
-                            os._exit(3)  # systemd (Restart=always) brings the worker back clean
-                if printer_ok:
-                    job = fetch_next_job()
-                    if job:
-                        try:
-                            process_job(job)
-                        except Exception as e:
-                            print(f"[job {job['id']}] FAILED: {e}")
-                            traceback.print_exc()
-                            try:
-                                extra = {"ai_error": ("REJECTED: " + str(e))[:200]} if isinstance(e, FileRejected) else None
-                                set_job_status(job["id"], "FAILED", extra)
-                            except Exception as inner:
-                                print(f"[job {job['id']}] could not mark FAILED: {inner}")
+                            extra = {"ai_error": ("REJECTED: " + str(e))[:200]} if isinstance(e, FileRejected) else None
+                            set_job_status(job["id"], "FAILED", extra)
+                        except Exception as inner:
+                            print(f"[job {job['id']}] could not mark FAILED: {inner}")
         except Exception as e:
             print(f"[loop] unexpected error: {e}")
             traceback.print_exc()
