@@ -19,6 +19,7 @@ import resource
 import shutil
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 
@@ -102,22 +103,104 @@ def check_office_container(path: Path):
         raise FileRejected("This doesn't look like a real Word or PowerPoint file.")
 
 
-def sanitize(kind: str, src: Path, dst: Path) -> dict:
-    """kind is 'pdf' or 'image'. Returns page count + ink metrics; dst is the rebuilt PDF."""
-    env = {**os.environ, "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
-    try:
-        r = subprocess.run([sys.executable, str(Path(__file__).resolve()), kind, str(src), str(dst)],
-                           capture_output=True, text=True, timeout=WALL_TIMEOUT, env=env)
-    except subprocess.TimeoutExpired as e:
-        raise FileRejected("This file took too long to check and was rejected for safety.") from e
+_ctx_lock = threading.Lock()
+_start_lock = threading.Lock()
+_ctx_obj = None
+_ctx_failed = not _int("INSPECTOR_FORKSERVER", 1)
 
-    data = None
-    for line in reversed(r.stdout.strip().splitlines()):
+
+def _fork_ctx():
+    """A warm, pre-imported helper process that forks a fresh child per file.
+    Same isolation as before (new process + rlimits per file) but without paying Python/MuPDF/OpenCV import time every time."""
+    global _ctx_obj, _ctx_failed
+    if _ctx_failed:
+        return None
+    with _ctx_lock:
+        if _ctx_obj is None:
+            try:
+                os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+                os.environ.setdefault("OMP_NUM_THREADS", "1")
+                import multiprocessing as mp
+                ctx = mp.get_context("forkserver")
+                ctx.set_forkserver_preload(["inspector", "ink"])
+                from multiprocessing import forkserver
+                forkserver.ensure_running()
+                _ctx_obj = ctx
+            except Exception as e:
+                print(f"[inspector] warm start unavailable ({e}); using slower per-file start-up")
+                _ctx_failed = True
+                return None
+    return _ctx_obj
+
+
+def warm():
+    """Call once at worker start-up so the first student's upload doesn't pay the import cost."""
+    _fork_ctx()
+
+
+def _decode(r_stdout: str):
+    for line in reversed(r_stdout.strip().splitlines()):
         try:
-            data = json.loads(line)
-            break
+            return json.loads(line)
         except ValueError:
             continue
+    return None
+
+
+def _run_forked(ctx, kind, src, dst):
+    parent, child = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_forked_entry, args=(kind, str(src), str(dst), child), daemon=True)
+    # multiprocessing would make the child re-run the main script (print_worker.py) from the top, which we must not do.
+    with _start_lock:
+        main = sys.modules.get("__main__")
+        saved = [(a, getattr(main, a, None)) for a in ("__file__", "__spec__")]
+        for a, _ in saved:
+            if hasattr(main, a):
+                setattr(main, a, None)
+        try:
+            proc.start()
+        finally:
+            for a, v in saved:
+                if v is not None:
+                    setattr(main, a, v)
+    child.close()
+    data = None
+    try:
+        if parent.poll(WALL_TIMEOUT):
+            try:
+                data = parent.recv()
+            except (EOFError, OSError):
+                data = None  # child died (killed by a limit) without a verdict
+        else:
+            proc.kill()
+            raise FileRejected("This file took too long to check and was rejected for safety.")
+    finally:
+        parent.close()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+    return data
+
+
+def sanitize(kind: str, src: Path, dst: Path) -> dict:
+    """kind is 'pdf' or 'image'. Returns page count + ink metrics; dst is the rebuilt PDF."""
+    data, ctx = None, _fork_ctx()
+    if ctx is not None:
+        try:
+            data = _run_forked(ctx, kind, src, dst)
+        except FileRejected:
+            raise
+        except Exception as e:
+            print(f"[inspector] warm start failed ({e}); retrying the normal way")
+            ctx = None
+    if ctx is None:
+        env = {**os.environ, "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1"}
+        try:
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()), kind, str(src), str(dst)],
+                               capture_output=True, text=True, timeout=WALL_TIMEOUT, env=env)
+        except subprocess.TimeoutExpired as e:
+            raise FileRejected("This file took too long to check and was rejected for safety.") from e
+        data = _decode(r.stdout)
     if data and data.get("ok"):
         return data
     if data and data.get("reason"):
@@ -318,22 +401,35 @@ def measure_ink(pdf_path) -> dict:
     }
 
 
-def _child_main(argv):
-    kind, src, dst = argv
-    _apply_limits()
+def _verdict(kind, src, dst) -> dict:
+    """Runs inside the limited child. Always returns a dict the parent can trust as 'the child's answer'."""
     try:
         info = _sanitize_pdf(src, dst) if kind == "pdf" else _sanitize_image(src, dst)
         info.update(measure_ink(dst))
-        print(json.dumps({"ok": True, **info}))
+        return {"ok": True, **info}
     except FileRejected as e:
-        print(json.dumps({"ok": False, "reason": str(e)}))
-        sys.exit(3)
+        return {"ok": False, "reason": str(e)}
     except MemoryError:
-        print(json.dumps({"ok": False, "reason": "This file is too large or complex to process safely."}))
-        sys.exit(4)
+        return {"ok": False, "reason": "This file is too large or complex to process safely."}
     except Exception:
-        print(json.dumps({"ok": False, "reason": "This file couldn't be processed safely and was rejected."}))
-        sys.exit(5)
+        return {"ok": False, "reason": "This file couldn't be processed safely and was rejected."}
+
+
+def _forked_entry(kind, src, dst, conn):
+    _apply_limits()
+    try:
+        conn.send(_verdict(kind, src, dst))
+    finally:
+        conn.close()
+
+
+def _child_main(argv):
+    kind, src, dst = argv
+    _apply_limits()
+    res = _verdict(kind, src, dst)
+    print(json.dumps(res))
+    if not res["ok"]:
+        sys.exit(3)
 
 
 if __name__ == "__main__":

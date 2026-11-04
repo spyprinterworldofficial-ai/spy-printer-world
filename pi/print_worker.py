@@ -586,6 +586,7 @@ def main_loop():
           f"parallel checks={COUNT_WORKERS}")
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     warm_up_libreoffice()
+    inspector.warm()  # pre-load the checking libraries once, so each upload starts instantly
     threading.Thread(target=counting_dispatch_loop, daemon=True).start()
     last_warn = 0.0
 
