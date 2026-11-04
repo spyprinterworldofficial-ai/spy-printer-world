@@ -66,7 +66,38 @@ def new_client() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-supabase: Client = new_client()  # main + AI thread (the heartbeat and telemetry threads get their own)
+class _PerThreadClient:
+    """The Supabase client (HTTP/2) is not safe to share between threads: two uploads at once corrupt each other.
+    Every thread therefore talks through its own client; check jobs borrow one from a small reusable pool."""
+
+    def __init__(self):
+        self._tl = threading.local()
+        self._pool: list = []
+        self._pool_lock = threading.Lock()
+
+    def _mine(self):
+        c = getattr(self._tl, "client", None)
+        if c is None:
+            c = self._tl.client = new_client()
+        return c
+
+    def __getattr__(self, name):
+        return getattr(self._mine(), name)
+
+    def borrow(self):
+        with self._pool_lock:
+            c = self._pool.pop() if self._pool else new_client()
+        self._tl.client = c
+
+    def give_back(self):
+        c = getattr(self._tl, "client", None)
+        self._tl.client = None
+        if c is not None:
+            with self._pool_lock:
+                self._pool.append(c)
+
+
+supabase = _PerThreadClient()
 
 lo_lock = threading.Lock()  # headless LibreOffice can't run two instances on one profile
 last_libreoffice_activity = 0.0
@@ -181,13 +212,27 @@ def set_job_status(job_id: str, status: str, extra: dict | None = None):
     supabase.table("print_jobs").update({"status": status, **(extra or {})}).eq("id", job_id).execute()
 
 
+def _retry(fn, tries=3):
+    """Wi-Fi blips happen; a dropped connection shouldn't fail a student's upload."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == tries - 1:
+                raise
+            print(f"[net] storage call failed ({type(e).__name__}); retrying")
+            time.sleep(1 + attempt)
+
+
 def download_job_file(storage_path: str, dest: Path):
-    dest.write_bytes(supabase.storage.from_(STORAGE_BUCKET).download(storage_path))
+    dest.write_bytes(_retry(lambda: supabase.storage.from_(STORAGE_BUCKET).download(storage_path)))
 
 
 def upload_pdf(pdf_path: Path, target_path: str) -> str:
-    with open(pdf_path, "rb") as f:
-        supabase.storage.from_(STORAGE_BUCKET).upload(target_path, f, file_options={"upsert": "true"})
+    def go():
+        with open(pdf_path, "rb") as f:
+            supabase.storage.from_(STORAGE_BUCKET).upload(target_path, f, file_options={"upsert": "true"})
+    _retry(go)
     return target_path
 
 
@@ -411,6 +456,14 @@ def process_counting_job(job: dict):
 
 
 def run_counting_job(job: dict):
+    supabase.borrow()
+    try:
+        _run_counting_job(job)
+    finally:
+        supabase.give_back()
+
+
+def _run_counting_job(job: dict):
     try:
         process_counting_job(job)
     except FileRejected as e:
