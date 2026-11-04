@@ -22,6 +22,7 @@ import traceback
 from pathlib import Path
 
 import requests
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from reportlab.pdfgen import canvas
@@ -73,8 +74,14 @@ hb = {"online": False, "printer_ok": False, "write_ok": False}
 # ---------------------------------------------------------------- checks / self-heal
 
 def check_internet() -> bool:
+    """Can this Pi reach what actually matters (Supabase)? Some campus networks block or slow google.com while everything we need works."""
     try:
-        requests.get("https://www.google.com", timeout=5)
+        socket.create_connection((urlparse(SUPABASE_URL).hostname, 443), timeout=4).close()
+        return True
+    except OSError:
+        pass
+    try:
+        requests.get("https://www.google.com", timeout=4)
         return True
     except requests.RequestException:
         return False
@@ -109,7 +116,7 @@ def heartbeat_loop():
     while True:
         try:
             online = check_internet()
-            printer_ok = check_printer_connected() if online else False
+            printer_ok = check_printer_connected()  # local CUPS check: independent of the internet
             if time.time() - last_caps > 30:
                 caps, last_caps = detect_capabilities(), time.time()
             base = {"pi_internet_online": online, "pi_printer_connected": printer_ok, "last_heartbeat": "now()"}
