@@ -48,6 +48,7 @@ CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
 
 STORAGE_BUCKET = "print-files"
+COUNT_WATCHDOG_SECONDS = int(os.environ.get("COUNT_WATCHDOG_SECONDS", "420"))  # AI summaries are slow on a Pi; normal checks take seconds
 MAX_COPIES_PER_JOB = int(os.environ.get("MAX_COPIES_PER_JOB", "50"))
 OFFICE_SUFFIXES = {".ppt", ".pptx", ".pps", ".ppsx", ".odp", ".doc", ".docx", ".odt", ".rtf"}
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
@@ -511,6 +512,7 @@ def main_loop():
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     warm_up_libreoffice()
     ai_thread, last_warn = None, 0.0
+    busy_job, busy_since, last_busy_log = None, 0.0, 0.0
 
     while True:
         try:
@@ -528,8 +530,24 @@ def main_loop():
                 if ai_thread is None or not ai_thread.is_alive():
                     counting = fetch_next_counting_job()
                     if counting:
+                        busy_job, busy_since = counting["id"], time.time()
                         ai_thread = threading.Thread(target=run_counting_job, args=(counting,), daemon=True)
                         ai_thread.start()
+                else:
+                    # One stuck job must never silently block every later upload.
+                    busy_for = time.time() - busy_since
+                    if busy_for > 60 and time.time() - last_busy_log > 60:
+                        print(f"[loop] counting job {busy_job} has been running {busy_for:.0f}s — later uploads wait behind it")
+                        last_busy_log = time.time()
+                    if busy_for > COUNT_WATCHDOG_SECONDS:
+                        print(f"[watchdog] job {busy_job} exceeded {COUNT_WATCHDOG_SECONDS}s — failing it and restarting the worker")
+                        try:
+                            supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_telemetry": None,
+                                "ai_error": "This file took too long to prepare. Please try again."}) \
+                                .eq("id", busy_job).eq("status", "COUNTING").execute()
+                        finally:
+                            subprocess.run(["pkill", "-f", "soffice.bin"], capture_output=True)
+                            os._exit(3)  # systemd (Restart=always) brings the worker back clean
                 if printer_ok:
                     job = fetch_next_job()
                     if job:
