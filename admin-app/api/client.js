@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { notifyUnauthorized } from './session';
 
 // Point this at wherever you deployed admin-backend (see its SETUP.md).
 // Using your laptop's LAN IP works fine for local testing on the same wifi
@@ -34,6 +35,10 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
   });
 
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && auth) {
+    await clearToken();
+    notifyUnauthorized();
+  }
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`);
   }

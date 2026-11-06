@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
+import { NavigationContainer, DefaultTheme, createNavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { ActivityIndicator, View } from 'react-native';
+import { ActivityIndicator, Alert, View } from 'react-native';
 
 import { getToken } from './api/client';
+import { setUnauthorizedHandler } from './api/session';
+import AccountButton from './components/AccountButton';
 import LoginScreen from './screens/LoginScreen';
 import InstituteListScreen from './screens/InstituteListScreen';
 import PrinterListScreen from './screens/PrinterListScreen';
@@ -12,8 +14,12 @@ import PrinterStatusScreen from './screens/PrinterStatusScreen';
 import PrintHistoryScreen from './screens/PrintHistoryScreen';
 import FinancialStatusScreen from './screens/FinancialStatusScreen';
 import RevenueHistoryScreen from './screens/RevenueHistoryScreen';
+import AccountScreen from './screens/AccountScreen';
+import UsersScreen from './screens/UsersScreen';
+import UserEditScreen from './screens/UserEditScreen';
 
 const Stack = createNativeStackNavigator();
+const navigationRef = createNavigationContainerRef();
 
 const darkTheme = {
   ...DefaultTheme,
@@ -27,11 +33,20 @@ const darkTheme = {
   },
 };
 
+const noAccountButton = { headerRight: () => null };
+
 export default function App() {
   const [initialRoute, setInitialRoute] = useState(null);
 
   useEffect(() => {
     getToken().then((token) => setInitialRoute(token ? 'InstituteList' : 'Login'));
+
+    // Any API call that comes back 401 (account disabled, password changed elsewhere, token expired) ends up here.
+    setUnauthorizedHandler(() => {
+      if (!navigationRef.isReady() || navigationRef.getCurrentRoute()?.name === 'Login') return;
+      navigationRef.resetRoot({ index: 0, routes: [{ name: 'Login' }] });
+      Alert.alert('Signed out', 'Your session has ended. Please sign in again.');
+    });
   }, []);
 
   if (!initialRoute) {
@@ -43,8 +58,15 @@ export default function App() {
   }
 
   return (
-    <NavigationContainer theme={darkTheme}>
-      <Stack.Navigator initialRouteName={initialRoute} screenOptions={{ headerStyle: { backgroundColor: '#131a21' }, headerTintColor: '#fff' }}>
+    <NavigationContainer theme={darkTheme} ref={navigationRef}>
+      <Stack.Navigator
+        initialRouteName={initialRoute}
+        screenOptions={({ navigation }) => ({
+          headerStyle: { backgroundColor: '#131a21' },
+          headerTintColor: '#fff',
+          headerRight: () => <AccountButton navigation={navigation} />,
+        })}
+      >
         <Stack.Screen name="Login" component={LoginScreen} options={{ headerShown: false }} />
         <Stack.Screen name="InstituteList" component={InstituteListScreen} options={{ title: 'Institutes' }} />
         <Stack.Screen name="PrinterList" component={PrinterListScreen} />
@@ -53,6 +75,9 @@ export default function App() {
         <Stack.Screen name="PrintHistory" component={PrintHistoryScreen} />
         <Stack.Screen name="FinancialStatus" component={FinancialStatusScreen} />
         <Stack.Screen name="RevenueHistory" component={RevenueHistoryScreen} />
+        <Stack.Screen name="Account" component={AccountScreen} options={{ title: 'Account', ...noAccountButton }} />
+        <Stack.Screen name="Users" component={UsersScreen} options={{ title: 'Users', ...noAccountButton }} />
+        <Stack.Screen name="UserEdit" component={UserEditScreen} options={noAccountButton} />
       </Stack.Navigator>
     </NavigationContainer>
   );

@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import { supabase } from '../db/supabaseAdmin.js';
+import { printerAccessParam } from '../middleware/access.js';
 
 const router = Router();
+
+// Every route below takes :printerId; vendors only get the printers assigned to them.
+router.param('printerId', printerAccessParam);
 
 // GET /finance/:printerId/today — today's revenue + the list of paid orders
 router.get('/:printerId/today', async (req, res) => {

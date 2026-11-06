@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import { supabase } from '../db/supabaseAdmin.js';
+import { printerAccessParam } from '../middleware/access.js';
 
 const router = Router();
+
+// Every route below takes :id, so no route can skip the "may this user operate this printer?" check.
+router.param('id', printerAccessParam);
 
 const CARTRIDGE_DUTY_CYCLE = Number(process.env.CARTRIDGE_DUTY_CYCLE || 10000);
 
