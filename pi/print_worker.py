@@ -634,6 +634,18 @@ def counting_dispatch_loop():
         time.sleep(COUNT_POLL_SECONDS)
 
 
+def storage_cleanup_loop():
+    """Hourly: delete this printer's files older than 24 h (unpaid / abandoned uploads were never removed)."""
+    import cleanup_storage
+    time.sleep(60)
+    while True:
+        try:
+            cleanup_storage.clean_old_files(supabase, PRINTER_ID)
+        except Exception as e:
+            print(f"[cleanup] skipped: {e}")
+        time.sleep(3600)
+
+
 def main_loop():
     print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}, "
           f"parallel checks={COUNT_WORKERS}")
@@ -641,6 +653,7 @@ def main_loop():
     warm_up_libreoffice()
     inspector.warm()  # pre-load the checking libraries once, so each upload starts instantly
     threading.Thread(target=counting_dispatch_loop, daemon=True).start()
+    threading.Thread(target=storage_cleanup_loop, daemon=True).start()
     last_warn = 0.0
 
     while True:
