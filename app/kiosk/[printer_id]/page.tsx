@@ -240,6 +240,7 @@ export default function KioskPage() {
   const printerId = params?.printer_id as string;
 
   const [showSplash, setShowSplash] = useState(true);
+  const PENDING_PAYMENT_KEY = `spy-pending-payment-${printerId}`;
   const [videoFailed, setVideoFailed] = useState(false);
 
   const [printerStatus, setPrinterStatus] = useState<PrinterStatus | null>(null);
@@ -288,6 +289,46 @@ export default function KioskPage() {
   useEffect(() => {
     const t = setTimeout(() => setShowSplash(false), 20000); // safety net if the video's 'ended' never fires
     return () => clearTimeout(t);
+  }, []);
+
+  // Coming back after paying: phones sometimes reload this tab while the UPI app is open, so the Razorpay success
+  // handler never runs and the student lands on the splash video. We remember the order before opening Razorpay
+  // and, on return, ask the server whether it was paid (it checks with Razorpay and marks the jobs PAID).
+  useEffect(() => {
+    let saved: { orderId: string; at: number } | null = null;
+    try { saved = JSON.parse(localStorage.getItem(PENDING_PAYMENT_KEY) || 'null'); } catch { /* storage blocked */ }
+    if (!saved?.orderId || Date.now() - saved.at > 30 * 60 * 1000) {
+      try { localStorage.removeItem(PENDING_PAYMENT_KEY); } catch { /* ignore */ }
+      return;
+    }
+    setShowSplash(false);
+    let tries = 0;
+    const check = async () => {
+      tries += 1;
+      try {
+        const r = await fetch('/api/payment-status', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ order_id: saved!.orderId }),
+        });
+        const { state } = await r.json();
+        if (state === 'paid') {
+          try { localStorage.removeItem(PENDING_PAYMENT_KEY); } catch { /* ignore */ }
+          setStep('success');
+          return;
+        }
+        if ((state === 'processing' || !r.ok) && tries < 10) {
+          setErrorMsg('Checking your last payment…');
+          setTimeout(check, 3000);
+          return;
+        }
+        try { localStorage.removeItem(PENDING_PAYMENT_KEY); } catch { /* ignore */ }
+        setErrorMsg(state === 'processing'
+          ? 'Your last payment is still being processed by your bank. If money was deducted, it will print automatically or be refunded — contact support if not.'
+          : null);
+      } catch {
+        if (tries < 10) setTimeout(check, 3000);
+      }
+    };
+    check().then(() => setErrorMsg((m) => (m === 'Checking your last payment…' ? null : m)));
   }, []);
 
   useEffect(() => {
@@ -683,6 +724,7 @@ export default function KioskPage() {
       });
       if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as { error?: string }).error || 'Order creation failed');
       const orderData = await res.json();
+      try { localStorage.setItem(PENDING_PAYMENT_KEY, JSON.stringify({ orderId: orderData.order_id, at: Date.now() })); } catch { /* storage blocked */ }
 
       const rzp = new window.Razorpay({
         key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID,
@@ -704,6 +746,7 @@ export default function KioskPage() {
             });
             const result = await verify.json();
             if (!verify.ok || !result.success) throw new Error('Verification failed');
+            try { localStorage.removeItem(PENDING_PAYMENT_KEY); } catch { /* ignore */ }
             setStep('success');
           } catch (err) {
             console.error(err);
@@ -866,8 +909,8 @@ export default function KioskPage() {
             item.aiMode
               ? `Pages to summarise (e.g. 1-5, 8, 12-15) — leave blank for all ${item.totalPages}`
               : lockedByGreen
-              ? 'Page selection is off while Green AI is on'
-              : `Print specific pages (e.g. 1-5, 8, 12-15) — leave blank for all ${item.totalPages}`
+                ? 'Page selection is off while Green AI is on'
+                : `Print specific pages (e.g. 1-5, 8, 12-15) — leave blank for all ${item.totalPages}`
           }
           defaultValue={item.pageRange ? item.pageRange.split(',').join(', ') : ''}
           onChange={(e) => updatePageRange(item.id, e.target.value)}
@@ -948,14 +991,14 @@ export default function KioskPage() {
                 {item.category === 'BLANK'
                   ? `${item.pageCount} sheet${item.pageCount === 1 ? '' : 's'}`
                   : item.aiMode
-                  ? item.aiState === 'ready'
-                    ? `${item.pageCount} pg summary`
-                    : `${item.totalPages} pg source`
-                  : item.greenAi && item.greenReady
-                  ? `${item.pageCount} pg (was ${item.totalPages})`
-                  : item.pageRange
-                  ? `${item.pageCount} of ${item.totalPages} pg`
-                  : `${item.pageCount} pg`}
+                    ? item.aiState === 'ready'
+                      ? `${item.pageCount} pg summary`
+                      : `${item.totalPages} pg source`
+                    : item.greenAi && item.greenReady
+                      ? `${item.pageCount} pg (was ${item.totalPages})`
+                      : item.pageRange
+                        ? `${item.pageCount} of ${item.totalPages} pg`
+                        : `${item.pageCount} pg`}
               </span>
             )}
             <button onClick={() => removeFile(item.id)} disabled={item.counting || busy} className="btn btn-sm btn-outline-danger border-0">
@@ -1142,10 +1185,10 @@ export default function KioskPage() {
             {aiMode
               ? `${AI_META[aiMode].label} · ${CATEGORY_META[selectedCategory].label}`
               : selectedCategory === 'BLANK'
-              ? 'Blank Pages'
-              : files.length > 0
-              ? `Selected Files (${files.length})`
-              : `Add your ${CATEGORY_META[selectedCategory].label} files`}
+                ? 'Blank Pages'
+                : files.length > 0
+                  ? `Selected Files (${files.length})`
+                  : `Add your ${CATEGORY_META[selectedCategory].label} files`}
           </h6>
         </div>
       </div>
