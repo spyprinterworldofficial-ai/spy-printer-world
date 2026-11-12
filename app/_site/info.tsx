@@ -5,7 +5,7 @@ export const SITE = {
     name: 'S.py — Printer World',
     address: 'NIT Raipur, G. E. Road, Amanaka, Raipur, Chhattisgarh - 492010',
     email: 'spy.printerworld.official@gmail.com',
-    phone: 'FILL: +91 9354080166',
+    phone: '+91 9354080166',
     jurisdiction: 'Raipur, Chhattisgarh',
   },
   updated: '12 November 2026',
