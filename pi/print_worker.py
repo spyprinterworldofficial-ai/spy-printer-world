@@ -446,7 +446,9 @@ def process_counting_job(job: dict):
 
         patch["amount_paid"] = compute_amount(patch["pages_count"], copies, duplex, ai_mode, green_applied,
                                               fetch_this_printer_pricing())
-        supabase.table("print_jobs").update(patch).eq("id", jid).eq("status", "COUNTING").execute()
+        saved = supabase.table("print_jobs").update(patch).eq("id", jid).eq("status", "COUNTING").execute()
+        if not saved.data:
+            print(f"[count {jid}] result NOT saved: the job was no longer COUNTING (changed by the kiosk?)")
         if drop_original:  # only the rebuilt PDF is ever printed; the untrusted original can go
             try:
                 supabase.storage.from_(STORAGE_BUCKET).remove([drop_original])
@@ -584,6 +586,7 @@ def process_job(job: dict):
 def counting_dispatch_loop():
     """Own thread: checks students' files side by side, independent of whatever the printing loop is doing."""
     running: dict[str, tuple[threading.Thread, float, bool]] = {}  # job id -> (thread, started, uses_ai)
+    runs: dict[str, list[float]] = {}  # job id -> when we started it (to catch a job that keeps coming back)
     last_warn, last_busy_log = 0.0, 0.0
     while True:
         try:
@@ -600,18 +603,38 @@ def counting_dispatch_loop():
                 # Only one AI (Ollama) job at a time, since it needs the CPU cores; everything else runs in parallel.
                 if len(running) < COUNT_WORKERS:
                     ai_running = any(uses_ai for _, _, uses_ai in running.values())
+                    plain_running = sum(1 for _, _, uses_ai in running.values() if not uses_ai)
+                    now = time.time()
                     for job in fetch_counting_jobs():
                         if len(running) >= COUNT_WORKERS:
                             break
+                        jid = job["id"]
                         uses_ai = bool(job.get("ai_mode") or job.get("green_ai"))
-                        if job["id"] in running or (uses_ai and ai_running):
+                        if jid in running or (uses_ai and ai_running):
                             continue
-                        if running and mem_available_mb() < MIN_FREE_MB_TO_START:
-                            break  # leave the rest queued until a running check frees memory
+                        recent = [t for t in runs.get(jid, []) if now - t < 1200]
+                        if len(recent) >= 3:  # finished 3 times in 20 min and it's back again: never loop forever
+                            print(f"[count {jid}] keeps coming back to COUNTING — failing it so the queue keeps moving")
+                            supabase.table("print_jobs").update({"status": "COUNT_FAILED", "ai_telemetry": None,
+                                "ai_error": "This file couldn't finish preparing. Please remove it and upload it again."}) \
+                                .eq("id", jid).eq("status", "COUNTING").execute()
+                            runs.pop(jid, None)
+                            continue
+                        if running:
+                            mem = mem_available_mb()
+                            # An AI job holds most of the RAM; a plain file check is light. Always allow ONE plain check
+                            # next to it (unless RAM is critically low), so AI requests can never block other students.
+                            plain_ok = not uses_ai and plain_running == 0 and mem >= 200
+                            if mem < MIN_FREE_MB_TO_START and not plain_ok:
+                                continue
                         t = threading.Thread(target=run_counting_job, args=(job,), daemon=True)
-                        running[job["id"]] = (t, time.time(), uses_ai)
+                        running[jid] = (t, now, uses_ai)
+                        runs[jid] = recent + [now]
                         ai_running = ai_running or uses_ai
+                        plain_running += 0 if uses_ai else 1
                         t.start()
+                    for old_id in [k for k, v in runs.items() if now - max(v) > 1200]:
+                        del runs[old_id]
 
                 now = time.time()
                 for jid, (t, started, _) in list(running.items()):
