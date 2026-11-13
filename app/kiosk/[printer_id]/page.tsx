@@ -1104,30 +1104,33 @@ export default function KioskPage() {
         })}
       </div>
 
-      <div className="d-flex align-items-center gap-2 mt-2">
-        <i className="bi bi-stars text-info"></i>
-        <span className="small text-secondary fw-semibold text-uppercase">AI tools</span>
-        <span className="badge bg-secondary">on-device</span>
-      </div>
-      <div className="row g-3">
-        {(Object.keys(AI_META) as AiMode[]).map((mode) => {
-          const meta = AI_META[mode];
-          const price = mode === 'CHEATSHEET' ? cfg.cheatsheetPrice : cfg.execsumPrice;
-          const enabled = canUpload && slmReady;
-          return (
-            <div className="col-12 col-md-6" key={mode}>
-              <button disabled={!enabled} onClick={() => setAiMode(mode)} className="category-card w-100 p-3 d-flex align-items-center gap-3 border-0 text-start" style={{ background: meta.gradient }}>
-                <i className="bi bi-stars fs-1"></i>
-                <span>
-                  <span className="d-block fw-bold">{meta.label}</span>
-                  <span className="d-block small">{meta.blurb}</span>
-                  <span className="d-block small fw-semibold">{slmReady ? `Flat ₹${price.toFixed(0)} per copy` : 'Not available on this printer yet'}</span>
-                </span>
-              </button>
-            </div>
-          );
-        })}
-      </div>
+      {/* Cheat sheet / executive summary: shown only when the printer reports it can run them (SUMMARY_AI=on on the Pi) */}
+      {slmReady && (<>
+        <div className="d-flex align-items-center gap-2 mt-2">
+          <i className="bi bi-stars text-info"></i>
+          <span className="small text-secondary fw-semibold text-uppercase">AI tools</span>
+          <span className="badge bg-secondary">on-device</span>
+        </div>
+        <div className="row g-3">
+          {(Object.keys(AI_META) as AiMode[]).map((mode) => {
+            const meta = AI_META[mode];
+            const price = mode === 'CHEATSHEET' ? cfg.cheatsheetPrice : cfg.execsumPrice;
+            const enabled = canUpload && slmReady;
+            return (
+              <div className="col-12 col-md-6" key={mode}>
+                <button disabled={!enabled} onClick={() => setAiMode(mode)} className="category-card w-100 p-3 d-flex align-items-center gap-3 border-0 text-start" style={{ background: meta.gradient }}>
+                  <i className="bi bi-stars fs-1"></i>
+                  <span>
+                    <span className="d-block fw-bold">{meta.label}</span>
+                    <span className="d-block small">{meta.blurb}</span>
+                    <span className="d-block small fw-semibold">{slmReady ? `Flat ₹${price.toFixed(0)} per copy` : 'Not available on this printer yet'}</span>
+                  </span>
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </>)}
       {aiReady && (
         <p className="small text-center text-success mb-0">
           <i className="bi bi-leaf-fill me-1"></i>

@@ -138,9 +138,14 @@ def try_reconnect_wifi():
         print(f"[wifi-heal] failed: {e}")
 
 
+# Cheat sheet / executive summary need ~4 GB RAM to run without slowing everyone else down. Off by default;
+# set SUMMARY_AI=on in .env on a Pi with enough memory. (Eco-Ink / Green AI are light and stay available.)
+SUMMARY_AI_ON = os.environ.get("SUMMARY_AI", "off").lower() in ("1", "on", "true", "yes")
+
+
 def detect_capabilities() -> dict:
     ai_ready = ai_engine is not None
-    return {"ai_ready": ai_ready, "slm_ready": ai_ready and ai_engine.slm_available()}
+    return {"ai_ready": ai_ready, "slm_ready": ai_ready and SUMMARY_AI_ON and ai_engine.slm_available()}
 
 
 def heartbeat_loop():
@@ -193,8 +198,15 @@ def fetch_next_job():
 
 
 def fetch_counting_jobs(limit: int = 12) -> list[dict]:
-    return (supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID)
-            .eq("status", "COUNTING").order("created_at").limit(limit).execute().data or [])
+    """Plain uploads first, then AI requests — fetched separately, so a long queue of AI requests (each takes a
+    minute or more) can never hide plain uploads from the worker."""
+    def q():
+        return supabase.table("print_jobs").select("*").eq("printer_id", PRINTER_ID).eq("status", "COUNTING")
+    plain = (q().is_("ai_mode", "null").or_("green_ai.is.null,green_ai.eq.false")
+             .order("created_at").limit(limit).execute().data or [])
+    ai = (q().or_("ai_mode.not.is.null,green_ai.eq.true")
+          .order("created_at").limit(limit).execute().data or [])
+    return plain + ai
 
 
 def mem_available_mb() -> float:
@@ -393,10 +405,14 @@ def process_counting_job(job: dict):
     """COUNTING covers: exact page count of a PPT/DOC, Green AI compression, and summary generation."""
     jid, ftype, name = job["id"], job["file_type"], job["file_name"]
     ai_mode, green = job.get("ai_mode"), bool(job.get("green_ai"))
+    summary_off = bool(ai_mode) and not SUMMARY_AI_ON
+    if summary_off:  # request from an old page / tampered browser: check it as a normal file instead
+        ai_mode = None
     wants_ai = bool(ai_mode or green)
     copies = job.get("copies") or 1
     duplex = bool(job.get("duplex")) or ai_mode == "EXECSUM"
-    print(f"[count {jid}] {name} ({ftype}){' ' + ai_mode if ai_mode else ''}{' GREEN' if green else ''}")
+    print(f"[count {jid}] {name} ({ftype}){' ' + ai_mode if ai_mode else ''}{' GREEN' if green else ''}"
+          f"{' (summary AI is off: checked as a normal file)' if summary_off else ''}")
 
     if wants_ai and ai_engine is None:
         raise RuntimeError("AI features aren't installed on this printer yet.")
@@ -426,6 +442,8 @@ def process_counting_job(job: dict):
 
         patch = {"base_pages_count": base, "ai_error": None, "ai_telemetry": None,
                  "pages_count": base, "converted_pdf_path": conv_path, "status": "PENDING", **inspected}
+        if summary_off:
+            patch.update(ai_mode=None, ai_error="AI summaries are switched off on this printer right now.")
         green_applied = False
 
         if wants_ai:
@@ -609,7 +627,7 @@ def counting_dispatch_loop():
                         if len(running) >= COUNT_WORKERS:
                             break
                         jid = job["id"]
-                        uses_ai = bool(job.get("ai_mode") or job.get("green_ai"))
+                        uses_ai = bool((job.get("ai_mode") and SUMMARY_AI_ON) or job.get("green_ai"))
                         if jid in running or (uses_ai and ai_running):
                             continue
                         recent = [t for t in runs.get(jid, []) if now - t < 1200]
