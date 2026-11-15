@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { supabase } from '../db/supabaseAdmin.js';
 import { printerAccessParam } from '../middleware/access.js';
+import { startOfTodayIST } from '../lib/ist.js';
 
 const router = Router();
 
@@ -9,8 +10,7 @@ router.param('printerId', printerAccessParam);
 
 // GET /finance/:printerId/today — today's revenue + the list of paid orders
 router.get('/:printerId/today', async (req, res) => {
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
+  const startOfToday = startOfTodayIST();
 
   const { data, error } = await supabase
     .from('print_jobs')
@@ -37,50 +37,19 @@ router.get('/:printerId/today', async (req, res) => {
   });
 });
 
-// GET /finance/:printerId/total — lifetime total + monthly/weekly/yearly breakdown
+// GET /finance/:printerId/total — lifetime total + monthly/weekly/yearly breakdown.
+// Summed inside the database (admin_printer_finance): fetching rows and adding them up here stopped
+// working past 1,000 paid jobs, because Supabase returns at most 1,000 rows per request.
 router.get('/:printerId/total', async (req, res) => {
-  const { data, error } = await supabase
-    .from('print_jobs')
-    .select('amount_paid, created_at')
-    .eq('printer_id', req.params.printerId)
-    .in('status', ['PAID', 'PRINTING', 'COMPLETED']);
+  const { data, error } = await supabase.rpc('admin_printer_finance', { p_printer: req.params.printerId });
   if (error) return res.status(500).json({ error: error.message });
-
-  const totalRevenue = data.reduce((sum, j) => sum + Number(j.amount_paid), 0);
-
-  const byMonth = {};
-  const byWeek = {};
-  const byYear = {};
-
-  for (const job of data) {
-    const d = new Date(job.created_at);
-    const amount = Number(job.amount_paid);
-
-    const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    byMonth[monthKey] = (byMonth[monthKey] || 0) + amount;
-
-    const yearKey = `${d.getFullYear()}`;
-    byYear[yearKey] = (byYear[yearKey] || 0) + amount;
-
-    // ISO week number, for a simple weekly bucket
-    const weekDate = new Date(d);
-    weekDate.setDate(weekDate.getDate() + 4 - (weekDate.getDay() || 7));
-    const yearStart = new Date(weekDate.getFullYear(), 0, 1);
-    const weekNum = Math.ceil(((weekDate - yearStart) / 86400000 + 1) / 7);
-    const weekKey = `${weekDate.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
-    byWeek[weekKey] = (byWeek[weekKey] || 0) + amount;
-  }
-
-  const toSortedArray = (obj) =>
-    Object.entries(obj)
-      .map(([period, revenue]) => ({ period, revenue }))
-      .sort((a, b) => (a.period < b.period ? 1 : -1));
-
+  const rows = (list) => (list || []).map((r) => ({ period: r.period, revenue: Number(r.revenue) }));
   res.json({
-    totalRevenue,
-    monthly: toSortedArray(byMonth),
-    weekly: toSortedArray(byWeek),
-    yearly: toSortedArray(byYear),
+    totalRevenue: Number(data.total),
+    todayRevenue: Number(data.today),
+    monthly: rows(data.monthly),
+    weekly: rows(data.weekly),
+    yearly: rows(data.yearly),
   });
 });
 
@@ -117,3 +86,4 @@ router.get('/:printerId/history', async (req, res) => {
 });
 
 export default router;
+

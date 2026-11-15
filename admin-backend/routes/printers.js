@@ -18,35 +18,13 @@ router.get('/:id/status', async (req, res) => {
     .single();
   if (error) return res.status(500).json({ error: error.message });
 
-  // Lifetime total pages printed — summed from completed jobs, so this
-  // stays accurate even across cartridge replacements (unlike
-  // cartridge_page_count, which resets).
-  const { data: completedJobs, error: jobsError } = await supabase
-    .from('print_jobs')
-    .select('pages_count, copies')
-    .eq('printer_id', req.params.id)
-    .eq('status', 'COMPLETED');
-  if (jobsError) return res.status(500).json({ error: jobsError.message });
-
-  const totalPagesPrinted = completedJobs.reduce(
-    (sum, j) => sum + j.pages_count * (j.copies || 1), 0
-  );
-
-  // Today's print count, in the server's local date — good enough for a
-  // single-timezone deployment (India). Uses created_at as a proxy for when
-  // it was completed, which is fine at kiosk scale.
-  const startOfToday = new Date();
-  startOfToday.setHours(0, 0, 0, 0);
-  const { data: todayJobs, error: todayError } = await supabase
-    .from('print_jobs')
-    .select('pages_count, copies')
-    .eq('printer_id', req.params.id)
-    .eq('status', 'COMPLETED')
-    .gte('created_at', startOfToday.toISOString());
-  if (todayError) return res.status(500).json({ error: todayError.message });
-
-  const printsToday = todayJobs.length;
-  const pagesToday = todayJobs.reduce((sum, j) => sum + j.pages_count * (j.copies || 1), 0);
+  // Page counts are summed in the database (admin_printer_pages): reading the jobs and adding them up
+  // here stopped at 1,000 jobs (Supabase's per-request row limit). "Today" is Indian time.
+  const { data: pages, error: pagesError } = await supabase.rpc('admin_printer_pages', { p_printer: req.params.id, p_days: 1 });
+  if (pagesError) return res.status(500).json({ error: pagesError.message });
+  const totalPagesPrinted = Number(pages.total_pages);
+  const printsToday = Number(pages.prints_today);
+  const pagesToday = Number(pages.pages_today);
 
   res.json({
     printer,
@@ -58,32 +36,12 @@ router.get('/:id/status', async (req, res) => {
   });
 });
 
-// GET /printers/:id/history?days=30 — prints per day, for the history drill-down
+// GET /printers/:id/history?days=30 — prints per day (Indian dates), for the history drill-down
 router.get('/:id/history', async (req, res) => {
-  const days = Number(req.query.days || 30);
-  const since = new Date();
-  since.setDate(since.getDate() - days);
-  since.setHours(0, 0, 0, 0);
-
-  const { data, error } = await supabase
-    .from('print_jobs')
-    .select('created_at, pages_count, copies')
-    .eq('printer_id', req.params.id)
-    .eq('status', 'COMPLETED')
-    .gte('created_at', since.toISOString())
-    .order('created_at', { ascending: false });
+  const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 366);
+  const { data, error } = await supabase.rpc('admin_printer_pages', { p_printer: req.params.id, p_days: days });
   if (error) return res.status(500).json({ error: error.message });
-
-  // Group by calendar date
-  const byDate = {};
-  for (const job of data) {
-    const date = job.created_at.slice(0, 10); // YYYY-MM-DD
-    if (!byDate[date]) byDate[date] = { date, prints: 0, pages: 0 };
-    byDate[date].prints += 1;
-    byDate[date].pages += job.pages_count * (job.copies || 1);
-  }
-
-  res.json(Object.values(byDate).sort((a, b) => (a.date < b.date ? 1 : -1)));
+  res.json((data.history || []).map((d) => ({ date: d.date, prints: Number(d.prints), pages: Number(d.pages) })));
 });
 
 // PATCH /printers/:id/enable  { is_enabled: boolean }
@@ -137,3 +95,4 @@ router.post('/:id/reset-cartridge', async (req, res) => {
 });
 
 export default router;
+

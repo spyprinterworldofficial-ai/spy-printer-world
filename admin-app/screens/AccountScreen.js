@@ -53,8 +53,13 @@ export default function AccountScreen({ navigation }) {
       </View>
 
       {isSuper && (
-        <TouchableOpacity style={styles.primary} onPress={() => navigation.navigate('Users')}>
-          <Text style={styles.primaryText}>Manage users &amp; printer access</Text>
+        <TouchableOpacity style={styles.primary} onPress={() => navigation.navigate('Vendors')}>
+          <Text style={styles.primaryText}>Vendors — monthly pages &amp; revenue</Text>
+        </TouchableOpacity>
+      )}
+      {isSuper && (
+        <TouchableOpacity style={styles.secondary} onPress={() => navigation.navigate('Users')}>
+          <Text style={styles.secondaryText}>Manage users &amp; printer access</Text>
         </TouchableOpacity>
       )}
 

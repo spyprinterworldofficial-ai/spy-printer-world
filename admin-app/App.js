@@ -17,6 +17,7 @@ import RevenueHistoryScreen from './screens/RevenueHistoryScreen';
 import AccountScreen from './screens/AccountScreen';
 import UsersScreen from './screens/UsersScreen';
 import UserEditScreen from './screens/UserEditScreen';
+import VendorsScreen from './screens/VendorsScreen';
 
 const Stack = createNativeStackNavigator();
 const navigationRef = createNavigationContainerRef();
@@ -78,6 +79,7 @@ export default function App() {
         <Stack.Screen name="Account" component={AccountScreen} options={{ title: 'Account', ...noAccountButton }} />
         <Stack.Screen name="Users" component={UsersScreen} options={{ title: 'Users', ...noAccountButton }} />
         <Stack.Screen name="UserEdit" component={UserEditScreen} options={noAccountButton} />
+        <Stack.Screen name="Vendors" component={VendorsScreen} options={{ title: 'Vendors', ...noAccountButton }} />
       </Stack.Navigator>
     </NavigationContainer>
   );

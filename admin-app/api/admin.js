@@ -29,4 +29,8 @@ export const adminApi = {
   updateUser: (id, body) => call(`/users/${id}`, { method: 'PATCH', body }),
   setUserPrinters: (id, printerIds) => call(`/users/${id}/printers`, { method: 'PUT', body: { printerIds } }),
   deleteUser: (id) => call(`/users/${id}`, { method: 'DELETE' }),
+
+  vendorsOverview: (month) => call(`/users/vendors/overview${month ? `?month=${month}` : ''}`),
+  pauseVendor: (id, printers) => call(`/users/${id}/pause`, { method: 'POST', body: { printers } }),
+  resumeVendor: (id) => call(`/users/${id}/resume`, { method: 'POST' }),
 };

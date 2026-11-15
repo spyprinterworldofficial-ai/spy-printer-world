@@ -97,6 +97,94 @@ router.get('/printer-options', async (_req, res) => {
   }
 });
 
+// GET /users/vendors/overview?month=2026-11 — every vendor with that month's prints, pages and revenue
+router.get('/vendors/overview', async (req, res) => {
+  try {
+    const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month || '') ? req.query.month : null;
+    const now = new Date(Date.now() + 5.5 * 3600 * 1000); // Indian time
+    const m = month || `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+
+    const [{ data: users, error }, { data: stats, error: statErr }] = await Promise.all([
+      supabase.from('admin_users').select('id, username, display_name, role, is_active, created_at, paused_printer_ids').eq('role', 'VENDOR'),
+      supabase.rpc('admin_vendor_month_stats', { p_month: `${m}-01` }),
+    ]);
+    if (error) throw error;
+    if (statErr) throw statErr;
+
+    const byId = Object.fromEntries(stats.map((s) => [s.admin_user_id, s]));
+    const vendors = users.map((u) => {
+      const s = byId[u.id] || {};
+      return toPublic(u, {
+        printerCount: s.printer_count || 0,
+        prints: Number(s.prints || 0),
+        pages: Number(s.pages || 0),
+        revenue: Number(s.revenue || 0),
+        printersPaused: (u.paused_printer_ids || []).length,
+      });
+    });
+    vendors.sort((a, b) => b.revenue - a.revenue || (a.displayName || a.username).localeCompare(b.displayName || b.username));
+    res.json({
+      month: m,
+      totals: vendors.reduce((t, v) => ({ prints: t.prints + v.prints, pages: t.pages + v.pages, revenue: t.revenue + v.revenue }),
+        { prints: 0, pages: 0, revenue: 0 }),
+      vendors,
+    });
+  } catch (err) {
+    serverError(res, 'overview', err);
+  }
+});
+
+// POST /users/:id/pause  { printers: boolean }
+// Signs the vendor out and blocks sign-in. With printers: true, also switches off every printer assigned to them
+// (remembered, so Resume switches back on exactly those).
+router.post('/:id/pause', async (req, res) => {
+  try {
+    const user = await loadVendor(res, req.params.id);
+    if (!user) return;
+    const patch = { is_active: false };
+    if ((req.body || {}).printers === true) {
+      const { data: access, error } = await supabase.from('printer_access').select('printer_id').eq('admin_user_id', user.id);
+      if (error) throw error;
+      const ids = access.map((a) => a.printer_id);
+      let switchedOff = [];
+      if (ids.length) {
+        const { data: on, error: e2 } = await supabase.from('printers').update({ is_enabled: false })
+          .in('id', ids).eq('is_enabled', true).select('id');
+        if (e2) throw e2;
+        switchedOff = on.map((p) => p.id);
+      }
+      const { data: row, error: e3 } = await supabase.from('admin_users').select('paused_printer_ids').eq('id', user.id).single();
+      if (e3) throw e3;
+      patch.paused_printer_ids = [...new Set([...(row.paused_printer_ids || []), ...switchedOff])];
+    }
+    const { error } = await supabase.from('admin_users').update(patch).eq('id', user.id);
+    if (error) throw error;
+    res.json({ success: true, printersSwitchedOff: patch.paused_printer_ids?.length || 0 });
+  } catch (err) {
+    serverError(res, 'pause', err);
+  }
+});
+
+// POST /users/:id/resume — allows sign-in again and switches back on the printers that Pause switched off
+router.post('/:id/resume', async (req, res) => {
+  try {
+    const user = await loadVendor(res, req.params.id);
+    if (!user) return;
+    const { data: row, error } = await supabase.from('admin_users').select('paused_printer_ids').eq('id', user.id).single();
+    if (error) throw error;
+    const ids = row.paused_printer_ids || [];
+    if (ids.length) {
+      const { error: e2 } = await supabase.from('printers').update({ is_enabled: true }).in('id', ids);
+      if (e2) throw e2;
+    }
+    const { error: e3 } = await supabase.from('admin_users').update({ is_active: true, paused_printer_ids: null }).eq('id', user.id);
+    if (e3) throw e3;
+    res.json({ success: true, printersSwitchedOn: ids.length });
+  } catch (err) {
+    serverError(res, 'resume', err);
+  }
+});
+
 // GET /users/:id
 router.get('/:id', async (req, res) => {
   try {
