@@ -13,6 +13,7 @@ and simply reports ai_ready/slm_ready = false so the kiosk hides those options.
 import hashlib
 import os
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -46,7 +47,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 PRINTER_ID = os.environ["PRINTER_ID"]
 CUPS_PRINTER_NAME = os.environ["CUPS_PRINTER_NAME"]
-POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "5"))      # heartbeat
+PRINT_POLL_SECONDS = float(os.environ.get("PRINT_POLL_SECONDS", "1"))         # how soon a paid job is picked up
 
 STORAGE_BUCKET = "print-files"
 COUNT_WORKERS = max(1, int(os.environ.get("COUNT_WORKERS", "2")))        # file checks that may run at once (Pi has 4 cores)
@@ -56,7 +58,10 @@ COUNT_WATCHDOG_SECONDS = int(os.environ.get("COUNT_WATCHDOG_SECONDS", "420"))  #
 MAX_COPIES_PER_JOB = int(os.environ.get("MAX_COPIES_PER_JOB", "50"))
 OFFICE_SUFFIXES = {".ppt", ".pptx", ".pps", ".ppsx", ".odp", ".doc", ".docx", ".odt", ".rtf"}
 CONVERTIBLE_CATEGORIES = {"PPT", "DOC"}
-LIBREOFFICE_KEEPWARM_INTERVAL = 25
+# Re-read LibreOffice from disk now and then so the OS keeps it cached (a cold start on a Pi costs ~20 s).
+# Runs in its own low-priority thread with its own profile: it never blocks printing or a student's conversion.
+LIBREOFFICE_KEEPWARM_INTERVAL = int(os.environ.get("LIBREOFFICE_KEEPWARM_SECONDS", "600"))
+READY_DIR = Path(os.environ.get("READY_DIR", "/var/tmp/spy-ready"))  # files this Pi checked itself, ready to print
 
 FALLBACK_PRICING = {"cost_per_page": 5.0, "duplex_cost_per_sheet": 4.5, "green_ai_fee": 2.0,
                     "cheatsheet_price": 4.0, "execsum_price": 8.0}
@@ -99,7 +104,7 @@ class _PerThreadClient:
 
 supabase = _PerThreadClient()
 
-lo_lock = threading.Lock()  # headless LibreOffice can't run two instances on one profile
+lo_lock = threading.Lock()  # headless LibreOffice can't run two conversions on one profile
 last_libreoffice_activity = 0.0
 hb_lock = threading.Lock()
 hb = {"online": False, "printer_ok": False, "write_ok": False}
@@ -292,19 +297,22 @@ def convert_to_pdf(src: Path, workdir: Path) -> Path:
 
 
 def warm_up_libreoffice():
-    """First headless call after idling costs ~20s; keep it warm so no student pays for that."""
-    global last_libreoffice_activity
-    if not lo_lock.acquire(blocking=False):
-        return  # a real conversion is running
+    """Starts and stops LibreOffice once so its files stay in the OS cache. Lowest CPU priority and a separate
+    profile, so it runs alongside a real conversion instead of making it wait (it used to hold the lock)."""
+    start = time.time()
     try:
-        start = time.time()
-        subprocess.run(["libreoffice", "--headless", "--terminate_after_init"], timeout=40, capture_output=True)
-        print(f"[keepwarm] LibreOffice ready in {time.time() - start:.1f}s")
+        subprocess.run(["nice", "-n", "19", "libreoffice", "-env:UserInstallation=file:///tmp/spy-lo-keepwarm",
+                        "--headless", "--terminate_after_init"], timeout=60, capture_output=True)
+        print(f"[keepwarm] LibreOffice cached ({time.time() - start:.1f}s)")
     except Exception as e:
         print(f"[keepwarm] failed (non-fatal): {e}")
-    finally:
-        last_libreoffice_activity = time.time()
-        lo_lock.release()
+
+
+def keepwarm_loop():
+    while True:
+        if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
+            warm_up_libreoffice()
+        time.sleep(60)
 
 
 def get_pdf_page_count(pdf: Path) -> int:
@@ -321,6 +329,50 @@ def extract_page_range(src: Path, page_range: str, workdir: Path) -> Path:
     if not out.exists():
         raise RuntimeError("qpdf produced no output")
     return out
+
+
+_JOB_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def keep_ready(jid: str, pdf: Path, conv_path: str):
+    """Keeps this Pi's own checked copy of a file, so printing it later needs no download and no second check
+    (the copy never left this machine, unlike the one in storage). Best effort: printing falls back to storage."""
+    if not _JOB_ID.match(jid):
+        return
+    try:
+        READY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = READY_DIR / f".{jid}.tmp"
+        shutil.copyfile(pdf, tmp)
+        (READY_DIR / f"{jid}.path").write_text(conv_path)
+        tmp.replace(READY_DIR / f"{jid}.pdf")
+    except OSError as e:
+        print(f"[ready {jid}] not kept locally ({e})")
+
+
+def ready_copy(jid: str, conv_path: str | None) -> Path | None:
+    if not (conv_path and _JOB_ID.match(jid)):
+        return None
+    f, meta = READY_DIR / f"{jid}.pdf", READY_DIR / f"{jid}.path"
+    try:
+        return f if f.exists() and meta.read_text() == conv_path else None
+    except OSError:
+        return None
+
+
+def drop_ready(jid: str):
+    if _JOB_ID.match(jid):
+        for f in (READY_DIR / f"{jid}.pdf", READY_DIR / f"{jid}.path"):
+            f.unlink(missing_ok=True)
+
+
+def clean_old_ready(max_age_s: int = 86400):
+    cutoff = time.time() - max_age_s
+    for f in READY_DIR.glob("*") if READY_DIR.exists() else []:
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
 
 def generate_blank_pdf(num_pages: int, out: Path):
@@ -377,7 +429,11 @@ def inspect_upload(ftype: str, original: Path, wd: Path) -> tuple[Path, dict]:
     clean = wd / "clean.pdf"
     if ftype in CONVERTIBLE_CATEGORIES:
         inspector.check_office_container(original)
-        info = inspector.sanitize("pdf", convert_to_pdf(original, wd), clean)
+        t0 = time.time()
+        pdf = convert_to_pdf(original, wd)
+        convert_s = time.time() - t0
+        info = inspector.sanitize("pdf", pdf, clean)
+        info["convert_s"] = convert_s
     else:
         info = inspector.sanitize("image" if ftype == "IMAGE" else "pdf", original, clean)
     if not info["ink_ok_eco"]:
@@ -417,6 +473,8 @@ def process_counting_job(job: dict):
     if wants_ai and ai_engine is None:
         raise RuntimeError("AI features aren't installed on this printer yet.")
 
+    t0 = time.time()
+    tm: dict[str, float] = {}
     with tempfile.TemporaryDirectory() as tmp:
         wd = Path(tmp)
         src = wd / "source.pdf"
@@ -428,15 +486,23 @@ def process_counting_job(job: dict):
             # Already vetted earlier (this is an AI request on a PENDING job). Re-vet anyway: storage isn't trusted.
             raw = wd / "prev.pdf"
             download_job_file(conv_path, raw)
+            tm["download"] = time.time() - t0
             info = inspector.sanitize("pdf", raw, src)
+            tm["check"] = time.time() - t0 - tm["download"]
             base = info["pages"]
         else:
             original = wd / safe_upload_name(ftype, name)
             download_job_file(job["storage_path"], original)
+            tm["download"] = time.time() - t0
             clean, info = inspect_upload(ftype, original, wd)
+            tm["check"] = time.time() - t0 - tm["download"]
+            if info.get("convert_s"):
+                tm["of which convert"] = info["convert_s"]
             clean.replace(src)
             base, ink_forced = info["pages"], info["ink_forced"]
+            t1 = time.time()
             conv_path = upload_pdf(src, f"{job['storage_path']}.clean.pdf")
+            tm["upload"] = time.time() - t1
             inspected = {"inspected_at": "now()", "ink_forced": ink_forced, "eco_ink": True if ink_forced else job.get("eco_ink")}
             drop_original = job["storage_path"]  # deleted only after the result is safely saved
 
@@ -462,17 +528,23 @@ def process_counting_job(job: dict):
             else:  # Green AI found nothing to save: print the original, no fee
                 patch.update(green_ai=False, ai_pages_count=None, ai_pdf_path=None, ai_note=result["note"])
 
+        if not wants_ai:
+            keep_ready(jid, src, conv_path)
+        t1 = time.time()
         patch["amount_paid"] = compute_amount(patch["pages_count"], copies, duplex, ai_mode, green_applied,
                                               fetch_this_printer_pricing())
         saved = supabase.table("print_jobs").update(patch).eq("id", jid).eq("status", "COUNTING").execute()
+        tm["save"] = time.time() - t1
         if not saved.data:
+            drop_ready(jid)
             print(f"[count {jid}] result NOT saved: the job was no longer COUNTING (changed by the kiosk?)")
         if drop_original:  # only the rebuilt PDF is ever printed; the untrusted original can go
             try:
                 supabase.storage.from_(STORAGE_BUCKET).remove([drop_original])
             except Exception:
                 pass
-    print(f"[count {jid}] done: {patch['pages_count']} pages, Rs.{patch['amount_paid']}")
+    parts = ", ".join(f"{k} {v:.1f}s" for k, v in tm.items())
+    print(f"[count {jid}] done: {patch['pages_count']} pages, Rs.{patch['amount_paid']} in {time.time() - t0:.1f}s ({parts})")
 
 
 def run_counting_job(job: dict):
@@ -528,6 +600,7 @@ def process_job(job: dict):
     page_range, converted, ai_path = job.get("page_range"), job.get("converted_pdf_path"), job.get("ai_pdf_path")
     pages, copies = job["pages_count"], job.get("copies") or 1
     duplex = bool(job.get("duplex")) or ai_mode == "EXECSUM"
+    t0 = time.time()
     print(f"[job {jid}] {name} ({ftype}, {pages}p x{copies}{', duplex' if duplex else ''}"
           f"{', ' + ai_mode if ai_mode else ''}{', green' if green else ''}{', eco-ink' if job.get('eco_ink') else ''})")
     set_job_status(jid, "PRINTING")
@@ -535,6 +608,7 @@ def process_job(job: dict):
     ink_saved = None
     with tempfile.TemporaryDirectory() as tmp:
         wd = Path(tmp)
+        local = None
         if ftype == "BLANK":
             target = wd / "blank.pdf"
             generate_blank_pdf(pages, target)
@@ -545,7 +619,13 @@ def process_job(job: dict):
             if not source_path:
                 raise FileRejected("The prepared file for this job is missing.")
             target = wd / "in.pdf"
-            download_job_file(source_path, target)
+            # This Pi's own checked copy, if it has it (same file, never left the machine): no download and no
+            # second check needed. Ink-heavy files always take the full path, so the ink gate still applies.
+            local = None if (ai_mode or green or job.get("ink_forced")) else ready_copy(jid, converted)
+            if local:
+                shutil.copyfile(local, target)
+            else:
+                download_job_file(source_path, target)
 
             if page_range and not (ai_mode or green):
                 if not re.fullmatch(r"\d{1,4}(,\d{1,4}){0,999}", page_range):
@@ -555,23 +635,31 @@ def process_job(job: dict):
             if job.get("eco_ink") or job.get("ink_forced"):
                 target, ink_saved = apply_eco_ink(target, "PDF", wd)
 
-            # Last gate. Storage and the browser-editable columns aren't trusted, so what is about to hit CUPS
-            # is rebuilt and re-measured: never more pages than were paid for, never an ink bomb.
-            final = wd / "final.pdf"
-            info = inspector.sanitize("pdf", target, final)
-            if info["pages"] > pages:
-                raise FileRejected("The page count doesn't match what was paid for, so this job wasn't printed.")
-            if not info["ink_ok_raw"]:
-                raise FileRejected("This file is too ink-heavy to print.")
-            target = final
+            # Last gate: never more pages than were paid for, never an ink bomb. A file from storage isn't trusted,
+            # so it is rebuilt and re-measured; this Pi's own copy was measured when it was checked.
+            if local:
+                if get_pdf_page_count(target) > pages:
+                    raise FileRejected("The page count doesn't match what was paid for, so this job wasn't printed.")
+            else:
+                final = wd / "final.pdf"
+                info = inspector.sanitize("pdf", target, final)
+                if info["pages"] > pages:
+                    raise FileRejected("The page count doesn't match what was paid for, so this job wasn't printed.")
+                if not info["ink_ok_raw"]:
+                    raise FileRejected("This file is too ink-heavy to print.")
+                target = final
 
         if copies > MAX_COPIES_PER_JOB:
             raise FileRejected("Too many copies requested.")
 
-        print(f"[job {jid}] sending to '{CUPS_PRINTER_NAME}'")
         print_file(target, copies, duplex)
+        how = "blank" if ftype == "BLANK" else ("this Pi's checked copy" if local else "downloaded + re-checked")
+        print(f"[job {jid}] sent to '{CUPS_PRINTER_NAME}' {time.time() - t0:.1f}s after pick-up ({how})")
 
+    drop_ready(jid)
+    t1 = time.time()
     wait_until_printer_idle()
+    print(f"[job {jid}] printer finished {time.time() - t1:.0f}s after receiving it")
 
     # Paper counts sheets (a duplex copy of an odd page count still uses ceil(p/2) sheets);
     # toner counts logical pages either way.
@@ -682,6 +770,7 @@ def storage_cleanup_loop():
     while True:
         try:
             cleanup_storage.clean_old_files(supabase, PRINTER_ID)
+            clean_old_ready()
         except Exception as e:
             print(f"[cleanup] skipped: {e}")
         time.sleep(3600)
@@ -691,7 +780,7 @@ def main_loop():
     print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}, "
           f"parallel checks={COUNT_WORKERS}")
     threading.Thread(target=heartbeat_loop, daemon=True).start()
-    warm_up_libreoffice()
+    threading.Thread(target=keepwarm_loop, daemon=True).start()
     inspector.warm()  # pre-load the checking libraries once, so each upload starts instantly
     threading.Thread(target=counting_dispatch_loop, daemon=True).start()
     threading.Thread(target=storage_cleanup_loop, daemon=True).start()
@@ -699,9 +788,6 @@ def main_loop():
 
     while True:
         try:
-            if time.time() - last_libreoffice_activity > LIBREOFFICE_KEEPWARM_INTERVAL:
-                warm_up_libreoffice()
-
             with hb_lock:
                 write_ok, printer_ok = hb["write_ok"], hb["printer_ok"]
 
@@ -717,6 +803,7 @@ def main_loop():
                     except Exception as e:
                         print(f"[job {job['id']}] FAILED: {e}")
                         traceback.print_exc()
+                        drop_ready(job["id"])
                         try:
                             extra = {"ai_error": ("REJECTED: " + str(e))[:200]} if isinstance(e, FileRejected) else None
                             set_job_status(job["id"], "FAILED", extra)
@@ -725,7 +812,7 @@ def main_loop():
         except Exception as e:
             print(f"[loop] unexpected error: {e}")
             traceback.print_exc()
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(PRINT_POLL_SECONDS)
 
 
 if __name__ == "__main__":
