@@ -11,6 +11,7 @@ and simply reports ai_ready/slm_ready = false so the kiosk hides those options.
 """
 
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
@@ -42,6 +43,69 @@ load_dotenv()
 
 # Any blocking network call must eventually raise, otherwise a routing black hole freezes the worker silently.
 socket.setdefaulttimeout(15)
+
+# Campus Wi-Fi DNS is slow and sometimes fails ("Temporary failure in name resolution", 5 s timeouts). Every new
+# connection to Supabase looked the name up again, so moving a 100 KB file took 5-12 s. Answers are cached, refreshed
+# in the background, and the last good answer is kept when DNS fails. Only the very first lookup can be slow.
+DNS_TTL_SECONDS = int(os.environ.get("DNS_TTL_SECONDS", "300"))
+_real_getaddrinfo = socket.getaddrinfo
+_dns_cache: dict = {}        # key -> (looked up at, answer)
+_dns_refreshing: set = set()
+_dns_lock = threading.Lock()
+
+
+def _portal_answer(res) -> bool:
+    """A login portal (institute Wi-Fi when its session has lapsed) may answer every name with its own local
+    address. Such an answer for an internet service is never remembered."""
+    try:
+        ips = [ipaddress.ip_address(r[4][0].split("%")[0]) for r in res]
+    except (ValueError, IndexError):
+        return False
+    return bool(ips) and all((ip.is_private or ip.is_unspecified) and not ip.is_loopback for ip in ips)
+
+
+def _dns_lookup(key):
+    t = time.time()
+    res = _real_getaddrinfo(*key)
+    took = time.time() - t
+    if _portal_answer(res):
+        with _dns_lock:
+            old = _dns_cache.get(key)
+        if old:
+            print(f"[dns] {key[0]} answered with a local address (Wi-Fi login page?) — keeping the last good one")
+            return old[1]
+        return res  # nothing better known: use it, but don't remember it
+    if took > 1:
+        print(f"[dns] looking up {key[0]} took {took:.1f}s (slow Wi-Fi DNS) — cached now")
+    with _dns_lock:
+        _dns_cache[key] = (time.time(), res)
+    return res
+
+
+def _dns_refresh(key):
+    try:
+        _dns_lookup(key)
+    except OSError:
+        pass  # keep the old answer
+    finally:
+        with _dns_lock:
+            _dns_refreshing.discard(key)
+
+
+def _cached_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    key = (host, port, family, type, proto, flags)
+    with _dns_lock:
+        hit = _dns_cache.get(key)
+        stale = hit is not None and time.time() - hit[0] > DNS_TTL_SECONDS
+        if stale and key not in _dns_refreshing:
+            _dns_refreshing.add(key)
+            threading.Thread(target=_dns_refresh, args=(key,), daemon=True).start()
+    if hit:
+        return hit[1]  # fresh, or stale while a background refresh runs
+    return _dns_lookup(key)
+
+
+socket.getaddrinfo = _cached_getaddrinfo
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -779,6 +843,10 @@ def storage_cleanup_loop():
 def main_loop():
     print(f"S.py print worker starting for printer_id={PRINTER_ID}, CUPS queue='{CUPS_PRINTER_NAME}', AI={'on' if ai_engine else 'off'}, "
           f"parallel checks={COUNT_WORKERS}")
+    try:
+        socket.getaddrinfo(urlparse(SUPABASE_URL).hostname, 443, 0, socket.SOCK_STREAM)  # warm the DNS cache
+    except OSError as e:
+        print(f"[dns] first lookup failed ({e}); will retry")
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     threading.Thread(target=keepwarm_loop, daemon=True).start()
     inspector.warm()  # pre-load the checking libraries once, so each upload starts instantly
